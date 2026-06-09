@@ -16,6 +16,10 @@ from app.schemas.domain import (
     Event,
     HookRecord,
     HookStateChange,
+    GovernanceEvent,
+    GovernancePolicy,
+    LongTermMemoryRecord,
+    MemoryRetrievalTrace,
     Project,
     Snapshot,
     StoryBible,
@@ -65,6 +69,10 @@ class WorkspaceStore:
                 "reader_council_reports": {},
                 "hook_records": {},
                 "hook_state_changes": {},
+                "governance_policies": {},
+                "governance_events": {},
+                "long_term_memories": {},
+                "memory_retrieval_traces": {},
             }
         )
 
@@ -92,6 +100,10 @@ class WorkspaceStore:
             "reader_council_reports": {},
             "hook_records": {},
             "hook_state_changes": {},
+            "governance_policies": {},
+            "governance_events": {},
+            "long_term_memories": {},
+            "memory_retrieval_traces": {},
         }.items():
             if key not in payload:
                 payload[key] = default
@@ -124,6 +136,7 @@ class WorkspaceStore:
             tone=project.tone,
             author_intent=[project.premise],
         ).model_dump(mode="json")
+        db["governance_policies"][project.id] = GovernancePolicy(project_id=project.id).model_dump(mode="json")
         self._write(db)
         return project
 
@@ -136,6 +149,22 @@ class WorkspaceStore:
             self._write(db)
             return bible
         return StoryBible.model_validate(item)
+
+    def get_governance_policy(self, project_id: str) -> GovernancePolicy:
+        db = self._read()
+        item = db["governance_policies"].get(project_id)
+        if item is None:
+            policy = GovernancePolicy(project_id=project_id)
+            db["governance_policies"][project_id] = policy.model_dump(mode="json")
+            self._write(db)
+            return policy
+        return GovernancePolicy.model_validate(item)
+
+    def save_governance_policy(self, project_id: str, policy: GovernancePolicy) -> GovernancePolicy:
+        db = self._read()
+        db["governance_policies"][project_id] = policy.model_dump(mode="json")
+        self._write(db)
+        return policy
 
     def upsert_story_bible(self, project_id: str, story_bible: StoryBible) -> StoryBible:
         db = self._read()
@@ -476,6 +505,52 @@ class WorkspaceStore:
         db["hook_state_changes"].setdefault(project_id, []).append(change.model_dump(mode="json"))
         self._write(db)
         return change
+
+    def list_governance_events(self, project_id: str) -> list[GovernanceEvent]:
+        db = self._read()
+        items = db["governance_events"].get(project_id, [])
+        return [GovernanceEvent.model_validate(item) for item in items]
+
+    def add_governance_event(self, project_id: str, event: GovernanceEvent) -> GovernanceEvent:
+        db = self._read()
+        db["governance_events"].setdefault(project_id, []).append(event.model_dump(mode="json"))
+        self._write(db)
+        return event
+
+    def list_long_term_memories(self, project_id: str) -> list[LongTermMemoryRecord]:
+        db = self._read()
+        items = db["long_term_memories"].get(project_id, [])
+        return [LongTermMemoryRecord.model_validate(item) for item in items]
+
+    def replace_long_term_memories(
+        self,
+        project_id: str,
+        records: list[LongTermMemoryRecord],
+    ) -> list[LongTermMemoryRecord]:
+        db = self._read()
+        db["long_term_memories"][project_id] = [item.model_dump(mode="json") for item in records]
+        self._write(db)
+        return records
+
+    def list_memory_retrieval_traces(self, project_id: str) -> list[MemoryRetrievalTrace]:
+        db = self._read()
+        items = db["memory_retrieval_traces"].get(project_id, [])
+        return [MemoryRetrievalTrace.model_validate(item) for item in items]
+
+    def add_memory_retrieval_trace(
+        self,
+        project_id: str,
+        trace: MemoryRetrievalTrace,
+    ) -> MemoryRetrievalTrace:
+        db = self._read()
+        traces = db["memory_retrieval_traces"].setdefault(project_id, [])
+        traces.append(trace.model_dump(mode="json"))
+        limit = get_settings().memory_trace_limit
+        if limit > 0 and len(traces) > limit:
+            traces = traces[-limit:]
+        db["memory_retrieval_traces"][project_id] = traces
+        self._write(db)
+        return trace
 
     def rollback_to_chapter(
         self,

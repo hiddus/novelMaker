@@ -25,6 +25,8 @@ class Settings(BaseSettings):
     context_max_snapshots: int = 4
     context_max_patches: int = 3
     context_max_characters: int = 6
+    context_max_memories: int = 8
+    memory_trace_limit: int = 40
     cors_origins: list[str] = ["http://localhost:5173"]
 
     model_config = SettingsConfigDict(

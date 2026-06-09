@@ -13,6 +13,7 @@ def get_project_detail(project_id: str) -> ProjectDetail:
     return ProjectDetail(
         project=project,
         story_bible=store.get_story_bible(project_id),
+        governance_policy=store.get_governance_policy(project_id),
         characters=store.list_characters(project_id),
         character_states=store.list_character_states(project_id),
         events=store.list_events(project_id),
@@ -29,6 +30,9 @@ def get_project_detail(project_id: str) -> ProjectDetail:
         reviews=store.list_reviews(project_id),
         continuity_reports=store.list_continuity_reports(project_id),
         reader_council_reports=store.list_reader_council_reports(project_id),
+        governance_events=store.list_governance_events(project_id),
+        long_term_memories=store.list_long_term_memories(project_id),
+        memory_retrieval_traces=store.list_memory_retrieval_traces(project_id),
         chapter_metrics=store.list_chapter_metrics(project_id),
         metrics_summary=store.build_metrics_summary(project_id),
         latest_run=latest_run,

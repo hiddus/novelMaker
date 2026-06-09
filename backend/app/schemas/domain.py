@@ -150,6 +150,64 @@ class SchedulerTaskCreate(BaseModel):
     patch_id: str | None = None
 
 
+class GovernancePolicyUpdate(BaseModel):
+    enabled: bool = True
+    max_consecutive_failures: int = 3
+    max_total_estimated_cost_usd: float = 20.0
+    max_chapter_cost_usd: float = 1.0
+    max_conflict_score: float = 4.0
+    min_reader_score: float = 6.0
+    min_review_score: float = 6.0
+    pause_on_review_required: bool = True
+    pause_on_reader_weak: bool = True
+    pause_on_state_anomaly: bool = True
+    state_anomaly_keywords: list[str] = Field(
+        default_factory=lambda: ["失控", "失忆", "暴走", "濒死", "死亡", "叛逃", "黑化"]
+    )
+
+
+class GovernancePolicy(BaseModel):
+    id: str = Field(default_factory=lambda: new_id("govpolicy"))
+    project_id: str
+    enabled: bool = True
+    max_consecutive_failures: int = 3
+    max_total_estimated_cost_usd: float = 20.0
+    max_chapter_cost_usd: float = 1.0
+    max_conflict_score: float = 4.0
+    min_reader_score: float = 6.0
+    min_review_score: float = 6.0
+    pause_on_review_required: bool = True
+    pause_on_reader_weak: bool = True
+    pause_on_state_anomaly: bool = True
+    state_anomaly_keywords: list[str] = Field(
+        default_factory=lambda: ["失控", "失忆", "暴走", "濒死", "死亡", "叛逃", "黑化"]
+    )
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+
+class GovernanceDecision(BaseModel):
+    action: Literal["continue", "pause", "stop"] = "continue"
+    status: Literal["clear", "warning", "blocked"] = "clear"
+    signal: Literal["budget", "failure", "continuity", "reader", "state", "review", "manual"] = "manual"
+    reason: str = ""
+    details: list[str] = Field(default_factory=list)
+    chapter_number: int | None = None
+
+
+class GovernanceEvent(BaseModel):
+    id: str = Field(default_factory=lambda: new_id("govevent"))
+    project_id: str
+    task_id: str
+    policy_id: str | None = None
+    chapter_number: int | None = None
+    level: Literal["info", "warning", "critical"] = "info"
+    signal: Literal["budget", "failure", "continuity", "reader", "state", "review", "manual"]
+    action: Literal["continue", "pause", "stop"] = "continue"
+    summary: str
+    details: list[str] = Field(default_factory=list)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+
 class RollbackRequest(BaseModel):
     target_chapter_number: int
     reason: str = "manual rollback"
@@ -199,6 +257,7 @@ class ContextPack(BaseModel):
     story_bible: StoryBible
     recent_events: list[Event] = Field(default_factory=list)
     active_characters: list[Character] = Field(default_factory=list)
+    long_term_memories: list["MemoryRetrievalHit"] = Field(default_factory=list)
     open_hooks: list["HookRecord"] = Field(default_factory=list)
     recent_character_states: list[CharacterState] = Field(default_factory=list)
     recent_snapshots: list[Snapshot] = Field(default_factory=list)
@@ -211,6 +270,7 @@ class ContextPack(BaseModel):
     event_summary: str = ""
     character_state_summary: str = ""
     patch_summary: str = ""
+    memory_summary: str = ""
     token_budget: dict[str, int] = Field(default_factory=dict)
     retrieval_diagnostics: dict[str, list[str]] = Field(default_factory=dict)
     selection_reasoning: list[str] = Field(default_factory=list)
@@ -314,6 +374,54 @@ class TaskRun(BaseModel):
     result_summary: str = ""
 
 
+class LongTermMemoryRecord(BaseModel):
+    id: str = Field(default_factory=lambda: new_id("memory"))
+    project_id: str
+    source_type: Literal[
+        "chapter",
+        "event",
+        "character_state",
+        "snapshot",
+        "hook",
+        "patch",
+        "review",
+        "continuity",
+        "reader",
+    ]
+    source_id: str
+    chapter_number: int
+    memory_type: Literal["fact", "state", "risk", "foreshadow", "summary"] = "fact"
+    title: str = ""
+    content: str
+    keywords: list[str] = Field(default_factory=list)
+    importance_score: float = 1.0
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+
+class MemoryRetrievalHit(BaseModel):
+    record_id: str
+    chapter_number: int
+    source_type: str
+    memory_type: str
+    title: str = ""
+    content: str
+    retrieval_score: float = 0.0
+    matched_terms: list[str] = Field(default_factory=list)
+    reasons: list[str] = Field(default_factory=list)
+
+
+class MemoryRetrievalTrace(BaseModel):
+    id: str = Field(default_factory=lambda: new_id("memtrace"))
+    project_id: str
+    chapter_number: int
+    query_text: str = ""
+    query_terms: list[str] = Field(default_factory=list)
+    selected_record_ids: list[str] = Field(default_factory=list)
+    hits: list[MemoryRetrievalHit] = Field(default_factory=list)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+
 class RetconPatch(BaseModel):
     id: str = Field(default_factory=lambda: new_id("retcon"))
     project_id: str
@@ -372,14 +480,21 @@ class SchedulerTask(BaseModel):
     tone: str = "热血升级"
     writer_mode: Literal["auto", "mock", "openai"] = "auto"
     mode: Literal["write", "recovery"] = "write"
-    stage: Literal["writing", "awaiting_review", "replanning", "rerunning", "completed"] = "writing"
+    stage: Literal["writing", "awaiting_review", "replanning", "rerunning", "governance_blocked", "completed"] = "writing"
     patch_id: str | None = None
     status: Literal["pending", "running", "paused", "completed", "failed"] = "pending"
     completed_chapters: list[int] = Field(default_factory=list)
     retry_count: int = 0
     max_retries: int = 2
+    consecutive_failures: int = 0
     last_error: str = ""
     stage_message: str = ""
+    governance_policy_id: str | None = None
+    governance_status: Literal["clear", "warning", "blocked"] = "clear"
+    governance_reason: str = ""
+    governance_last_event_id: str | None = None
+    governance_cost_used_usd: float = 0.0
+    governance_cost_limit_usd: float = 0.0
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
@@ -524,6 +639,7 @@ class ReplanPatchResult(BaseModel):
 class ProjectDetail(BaseModel):
     project: Project
     story_bible: StoryBible
+    governance_policy: GovernancePolicy | None = None
     characters: list[Character] = Field(default_factory=list)
     character_states: list[CharacterState] = Field(default_factory=list)
     events: list[Event] = Field(default_factory=list)
@@ -540,6 +656,9 @@ class ProjectDetail(BaseModel):
     reviews: list[ReviewReport] = Field(default_factory=list)
     continuity_reports: list[ContinuityReport] = Field(default_factory=list)
     reader_council_reports: list[ReaderCouncilReport] = Field(default_factory=list)
+    governance_events: list[GovernanceEvent] = Field(default_factory=list)
+    long_term_memories: list[LongTermMemoryRecord] = Field(default_factory=list)
+    memory_retrieval_traces: list[MemoryRetrievalTrace] = Field(default_factory=list)
     chapter_metrics: list[ChapterMetric] = Field(default_factory=list)
     metrics_summary: MetricsSummary | None = None
     latest_run: WritingRun | None = None

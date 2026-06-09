@@ -13,9 +13,14 @@ from app.schemas.domain import (
     ContextPack,
     Event,
     EventCreate,
+    GovernanceEvent,
+    GovernancePolicy,
+    GovernancePolicyUpdate,
     HealthResponse,
     HookRecord,
     HookStateChange,
+    LongTermMemoryRecord,
+    MemoryRetrievalTrace,
     MetricsSummary,
     ReplanPatchRequest,
     ReplanPatchResult,
@@ -41,6 +46,7 @@ from app.schemas.domain import (
     WritingRun,
 )
 from app.services.context_engine import build_context_pack
+from app.services.memory import rebuild_long_term_memory
 from app.services.planning import build_chapter_plan, generate_book_plan
 from app.services.pipeline import (
     execute_batch_write,
@@ -105,6 +111,31 @@ def create_project(payload: ProjectCreate) -> Project:
 def get_project(project_id: str) -> ProjectDetail:
     _require_project(project_id)
     return get_project_detail(project_id)
+
+
+@router.get("/projects/{project_id}/governance/policy", response_model=GovernancePolicy)
+def get_governance_policy(project_id: str) -> GovernancePolicy:
+    _require_project(project_id)
+    return store.get_governance_policy(project_id)
+
+
+@router.put("/projects/{project_id}/governance/policy", response_model=GovernancePolicy)
+def update_governance_policy(project_id: str, payload: GovernancePolicyUpdate) -> GovernancePolicy:
+    _require_project(project_id)
+    current = store.get_governance_policy(project_id)
+    updated = current.model_copy(
+        update={
+            **payload.model_dump(),
+            "updated_at": datetime.now(UTC),
+        }
+    )
+    return store.save_governance_policy(project_id, updated)
+
+
+@router.get("/projects/{project_id}/governance-events", response_model=list[GovernanceEvent])
+def list_project_governance_events(project_id: str) -> list[GovernanceEvent]:
+    _require_project(project_id)
+    return store.list_governance_events(project_id)
 
 
 @router.get("/projects/{project_id}/story-bible", response_model=StoryBible)
@@ -173,6 +204,24 @@ def create_chapter_plan(project_id: str, payload: ChapterPlanCreate) -> dict[str
 def get_context_pack(project_id: str, chapter_number: int) -> ContextPack:
     _require_project(project_id)
     return build_context_pack(project_id, chapter_number)
+
+
+@router.get("/projects/{project_id}/memories", response_model=list[LongTermMemoryRecord])
+def list_project_memories(project_id: str) -> list[LongTermMemoryRecord]:
+    _require_project(project_id)
+    return store.list_long_term_memories(project_id)
+
+
+@router.post("/projects/{project_id}/memories/rebuild", response_model=list[LongTermMemoryRecord])
+def rebuild_project_memories(project_id: str) -> list[LongTermMemoryRecord]:
+    _require_project(project_id)
+    return rebuild_long_term_memory(project_id)
+
+
+@router.get("/projects/{project_id}/memory-traces", response_model=list[MemoryRetrievalTrace])
+def list_project_memory_traces(project_id: str) -> list[MemoryRetrievalTrace]:
+    _require_project(project_id)
+    return store.list_memory_retrieval_traces(project_id)
 
 
 @router.get("/projects/{project_id}/chapters")

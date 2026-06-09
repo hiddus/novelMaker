@@ -274,16 +274,61 @@ type ContextPack = {
   event_summary: string
   character_state_summary: string
   patch_summary: string
+  memory_summary: string
   token_budget: Record<string, number>
   retrieval_diagnostics: Record<string, string[]>
   selection_reasoning: string[]
   chapter_plan?: ChapterPlan | null
   recent_events: EventItem[]
   active_characters: Character[]
+  long_term_memories: MemoryRetrievalHit[]
   recent_character_states: CharacterState[]
   recent_snapshots: Snapshot[]
   open_hooks: HookRecord[]
   open_retcon_patches: RetconPatch[]
+}
+
+type LongTermMemoryRecord = {
+  id: string
+  source_type:
+    | 'chapter'
+    | 'event'
+    | 'character_state'
+    | 'snapshot'
+    | 'hook'
+    | 'patch'
+    | 'review'
+    | 'continuity'
+    | 'reader'
+  source_id: string
+  chapter_number: number
+  memory_type: 'fact' | 'state' | 'risk' | 'foreshadow' | 'summary'
+  title: string
+  content: string
+  keywords: string[]
+  importance_score: number
+}
+
+type MemoryRetrievalHit = {
+  record_id: string
+  chapter_number: number
+  source_type: string
+  memory_type: string
+  title: string
+  content: string
+  retrieval_score: number
+  matched_terms: string[]
+  reasons: string[]
+}
+
+type MemoryRetrievalTrace = {
+  id: string
+  chapter_number: number
+  query_text: string
+  query_terms: string[]
+  selected_record_ids: string[]
+  hits: MemoryRetrievalHit[]
+  created_at: string
 }
 
 type SchedulerTask = {
@@ -294,14 +339,56 @@ type SchedulerTask = {
   tone: string
   writer_mode: 'auto' | 'mock' | 'openai'
   mode: 'write' | 'recovery'
-  stage: 'writing' | 'awaiting_review' | 'replanning' | 'rerunning' | 'completed'
+  stage:
+    | 'writing'
+    | 'awaiting_review'
+    | 'replanning'
+    | 'rerunning'
+    | 'governance_blocked'
+    | 'completed'
   patch_id?: string | null
   status: 'pending' | 'running' | 'paused' | 'completed' | 'failed'
   completed_chapters: number[]
   retry_count: number
   max_retries: number
+  consecutive_failures: number
   last_error: string
   stage_message: string
+  governance_policy_id?: string | null
+  governance_status: 'clear' | 'warning' | 'blocked'
+  governance_reason: string
+  governance_last_event_id?: string | null
+  governance_cost_used_usd: number
+  governance_cost_limit_usd: number
+}
+
+type GovernancePolicy = {
+  id: string
+  enabled: boolean
+  max_consecutive_failures: number
+  max_total_estimated_cost_usd: number
+  max_chapter_cost_usd: number
+  max_conflict_score: number
+  min_reader_score: number
+  min_review_score: number
+  pause_on_review_required: boolean
+  pause_on_reader_weak: boolean
+  pause_on_state_anomaly: boolean
+  state_anomaly_keywords: string[]
+  updated_at?: string
+}
+
+type GovernanceEvent = {
+  id: string
+  task_id: string
+  policy_id?: string | null
+  chapter_number?: number | null
+  level: 'info' | 'warning' | 'critical'
+  signal: 'budget' | 'failure' | 'continuity' | 'reader' | 'state' | 'review' | 'manual'
+  action: 'continue' | 'pause' | 'stop'
+  summary: string
+  details: string[]
+  created_at: string
 }
 
 type ChapterMetric = {
@@ -340,6 +427,7 @@ type MetricsSummary = {
 type ProjectDetail = {
   project: Project
   story_bible: StoryBible
+  governance_policy?: GovernancePolicy | null
   characters: Character[]
   character_states: CharacterState[]
   events: EventItem[]
@@ -356,6 +444,9 @@ type ProjectDetail = {
   reviews: ReviewReport[]
   continuity_reports: ContinuityReport[]
   reader_council_reports: ReaderCouncilReport[]
+  governance_events: GovernanceEvent[]
+  long_term_memories: LongTermMemoryRecord[]
+  memory_retrieval_traces: MemoryRetrievalTrace[]
   chapter_metrics: ChapterMetric[]
   metrics_summary?: MetricsSummary | null
   latest_run?: WritingRun | null
@@ -463,6 +554,20 @@ const schedulerForm = reactive({
   max_retries: 2,
   mode: 'write' as 'write' | 'recovery',
   patch_id: '',
+})
+
+const governanceForm = reactive({
+  enabled: true,
+  max_consecutive_failures: 3,
+  max_total_estimated_cost_usd: 20,
+  max_chapter_cost_usd: 1,
+  max_conflict_score: 4,
+  min_reader_score: 6,
+  min_review_score: 6,
+  pause_on_review_required: true,
+  pause_on_reader_weak: true,
+  pause_on_state_anomaly: true,
+  state_anomaly_keywords: '失控\n失忆\n暴走\n濒死\n死亡\n叛逃\n黑化',
 })
 
 const modules = [
@@ -577,6 +682,7 @@ async function loadProjectDetail(projectId: string) {
     activeSchedulerTask.value =
       currentDetail.value.scheduler_tasks[currentDetail.value.scheduler_tasks.length - 1] ?? null
     syncStoryBibleForm()
+    syncGovernanceForm()
   } catch (error) {
     banner.value = error instanceof Error ? error.message : '加载项目详情失败'
   }
@@ -593,6 +699,22 @@ function syncStoryBibleForm() {
   storyBibleForm.core_setting = bible.core_setting.join('\n')
   storyBibleForm.author_intent = bible.author_intent.join('\n')
   writingForm.tone = bible.tone
+}
+
+function syncGovernanceForm() {
+  const policy = currentDetail.value?.governance_policy
+  if (!policy) return
+  governanceForm.enabled = policy.enabled
+  governanceForm.max_consecutive_failures = policy.max_consecutive_failures
+  governanceForm.max_total_estimated_cost_usd = policy.max_total_estimated_cost_usd
+  governanceForm.max_chapter_cost_usd = policy.max_chapter_cost_usd
+  governanceForm.max_conflict_score = policy.max_conflict_score
+  governanceForm.min_reader_score = policy.min_reader_score
+  governanceForm.min_review_score = policy.min_review_score
+  governanceForm.pause_on_review_required = policy.pause_on_review_required
+  governanceForm.pause_on_reader_weak = policy.pause_on_reader_weak
+  governanceForm.pause_on_state_anomaly = policy.pause_on_state_anomaly
+  governanceForm.state_anomaly_keywords = policy.state_anomaly_keywords.join('\n')
 }
 
 async function createProject() {
@@ -897,6 +1019,42 @@ async function createSchedulerTask() {
   }
 }
 
+async function saveGovernancePolicy() {
+  if (!selectedProjectId.value) return
+  busy.value = true
+  try {
+    await request(`/projects/${selectedProjectId.value}/governance/policy`, {
+      method: 'PUT',
+      body: JSON.stringify({
+        ...governanceForm,
+        state_anomaly_keywords: splitLines(governanceForm.state_anomaly_keywords),
+      }),
+    })
+    await loadProjectDetail(selectedProjectId.value)
+    banner.value = '运行治理策略已保存'
+  } catch (error) {
+    banner.value = error instanceof Error ? error.message : '保存治理策略失败'
+  } finally {
+    busy.value = false
+  }
+}
+
+async function rebuildMemories() {
+  if (!selectedProjectId.value) return
+  busy.value = true
+  try {
+    await request(`/projects/${selectedProjectId.value}/memories/rebuild`, {
+      method: 'POST',
+    })
+    await loadProjectDetail(selectedProjectId.value)
+    banner.value = '长期记忆索引已重建'
+  } catch (error) {
+    banner.value = error instanceof Error ? error.message : '重建长期记忆失败'
+  } finally {
+    busy.value = false
+  }
+}
+
 async function controlSchedulerTask(action: 'step' | 'pause' | 'resume' | 'retry') {
   if (!selectedProjectId.value || !activeSchedulerTask.value) return
   busy.value = true
@@ -951,7 +1109,7 @@ onMounted(async () => {
         <h1>长篇小说 Agent 生产系统工作台</h1>
         <p class="hero-text">
           当前版本已经可以完成项目创建、Story Bible 维护、角色/事件录入、章节规划和章节草稿生成。
-          后续继续扩展上下文工程、状态写回、版本化与人工审核闭环。
+          现在已经补上运行治理层，并继续加入长期记忆索引与跨章节召回。
         </p>
       </div>
       <div class="status-card" :data-tone="healthTone">
@@ -1339,6 +1497,15 @@ onMounted(async () => {
             <p>下一章：{{ activeSchedulerTask.next_chapter }}</p>
             <p>已完成：{{ activeSchedulerTask.completed_chapters.join(', ') || '无' }}</p>
             <p>重试：{{ activeSchedulerTask.retry_count }} / {{ activeSchedulerTask.max_retries }}</p>
+            <p>连续失败：{{ activeSchedulerTask.consecutive_failures }}</p>
+            <p>
+              治理：{{ activeSchedulerTask.governance_status }} /
+              {{ activeSchedulerTask.governance_reason || '当前无阻断原因' }}
+            </p>
+            <p>
+              预算：{{ activeSchedulerTask.governance_cost_used_usd }} /
+              {{ activeSchedulerTask.governance_cost_limit_usd }} USD
+            </p>
             <p>{{ activeSchedulerTask.stage_message || '暂无阶段说明' }}</p>
             <p v-if="activeSchedulerTask.last_error">错误：{{ activeSchedulerTask.last_error }}</p>
           </div>
@@ -1530,6 +1697,7 @@ onMounted(async () => {
             <p>最近事件：{{ currentContext.recent_events.length }}</p>
             <p>角色状态：{{ currentContext.recent_character_states.length }}</p>
             <p>最近快照：{{ currentContext.recent_snapshots.length }}</p>
+            <p>长期记忆命中：{{ currentContext.long_term_memories.length }}</p>
             <p>开放伏笔：{{ currentContext.open_hooks.length }}</p>
             <p>开放补丁：{{ currentContext.open_retcon_patches.length }}</p>
             <ul class="mini-list">
@@ -1555,6 +1723,9 @@ Character States:
 Retcon Patches:
 {{ currentContext.patch_summary }}
 
+Long-Term Memory:
+{{ currentContext.memory_summary }}
+
 Open Hooks:
 {{ currentContext.open_hooks.map((item) => `${item.status} / ${item.content}`).join('\n') || '暂无' }}
 
@@ -1570,6 +1741,18 @@ Token Budget:
                   <ul class="mini-list">
                     <li v-for="reason in currentContext.selection_reasoning" :key="reason">
                       {{ reason }}
+                    </li>
+                  </ul>
+                </div>
+                <div v-if="currentContext.long_term_memories.length" class="item-card">
+                  <h3>长期记忆命中</h3>
+                  <ul class="mini-list">
+                    <li
+                      v-for="memory in currentContext.long_term_memories"
+                      :key="memory.record_id"
+                    >
+                      第{{ memory.chapter_number }}章 / {{ memory.source_type }} /
+                      score={{ memory.retrieval_score }} / {{ memory.content }}
                     </li>
                   </ul>
                 </div>
@@ -1826,6 +2009,153 @@ Token Budget:
               第 {{ chapter.chapter_number }} 章 / rev {{ chapter.revision_number }} / 状态：{{ chapter.status }}
             </p>
             <p>{{ chapter.summary }}</p>
+          </div>
+        </div>
+      </article>
+    </section>
+
+    <section v-if="currentDetail" class="grid two-cols">
+      <article class="panel">
+        <div class="panel-head">
+          <h2>运行治理策略</h2>
+          <span>{{ currentDetail.governance_policy?.enabled ? 'enabled' : 'disabled' }}</span>
+        </div>
+        <div class="form-grid">
+          <label>
+            <span>启用治理</span>
+            <input v-model="governanceForm.enabled" type="checkbox" />
+          </label>
+          <label>
+            <span>连续失败阈值</span>
+            <input v-model.number="governanceForm.max_consecutive_failures" type="number" min="1" />
+          </label>
+          <label>
+            <span>总预算 USD</span>
+            <input v-model.number="governanceForm.max_total_estimated_cost_usd" type="number" min="0" step="0.1" />
+          </label>
+          <label>
+            <span>单章预算 USD</span>
+            <input v-model.number="governanceForm.max_chapter_cost_usd" type="number" min="0" step="0.1" />
+          </label>
+          <label>
+            <span>冲突分阈值</span>
+            <input v-model.number="governanceForm.max_conflict_score" type="number" min="0" step="0.5" />
+          </label>
+          <label>
+            <span>最小读者分</span>
+            <input v-model.number="governanceForm.min_reader_score" type="number" min="0" max="10" step="0.5" />
+          </label>
+          <label>
+            <span>最小评审分</span>
+            <input v-model.number="governanceForm.min_review_score" type="number" min="0" max="10" step="0.5" />
+          </label>
+          <label>
+            <span>评审待定即暂停</span>
+            <input v-model="governanceForm.pause_on_review_required" type="checkbox" />
+          </label>
+          <label>
+            <span>读者弱反馈即暂停</span>
+            <input v-model="governanceForm.pause_on_reader_weak" type="checkbox" />
+          </label>
+          <label>
+            <span>状态异常即暂停</span>
+            <input v-model="governanceForm.pause_on_state_anomaly" type="checkbox" />
+          </label>
+          <label class="full">
+            <span>状态异常关键词</span>
+            <textarea v-model="governanceForm.state_anomaly_keywords" rows="4" />
+          </label>
+        </div>
+        <div class="actions">
+          <button :disabled="busy" @click="saveGovernancePolicy">保存治理策略</button>
+        </div>
+        <p class="muted">
+          用于控制预算耗尽、连续失败、连续性冲突和关键状态异常时的自动停机行为。
+        </p>
+      </article>
+
+      <article class="panel">
+        <div class="panel-head">
+          <h2>治理事件流</h2>
+          <span>{{ currentDetail.governance_events.length }} 条</span>
+        </div>
+        <div class="stack compact">
+          <div class="item-card">
+            <h3>当前预算</h3>
+            <p>
+              {{ currentDetail.metrics_summary?.total_estimated_cost_usd ?? 0 }} /
+              {{ currentDetail.governance_policy?.max_total_estimated_cost_usd ?? 0 }} USD
+            </p>
+            <p>最近告警：{{ currentDetail.metrics_summary?.latest_warnings.join('；') || '暂无' }}</p>
+          </div>
+          <div
+            v-for="event in currentDetail.governance_events.slice().reverse()"
+            :key="event.id"
+            class="item-card"
+          >
+            <h3>{{ event.signal }} / {{ event.action }} / {{ event.level }}</h3>
+            <p>{{ event.summary }}</p>
+            <p>任务：{{ event.task_id }} / 章节：{{ event.chapter_number ?? 'n/a' }}</p>
+            <p>{{ event.created_at }}</p>
+            <ul class="mini-list">
+              <li v-for="detail in event.details" :key="`${event.id}-${detail}`">{{ detail }}</li>
+            </ul>
+          </div>
+        </div>
+      </article>
+    </section>
+
+    <section v-if="currentDetail" class="grid two-cols">
+      <article class="panel">
+        <div class="panel-head">
+          <h2>长期记忆索引</h2>
+          <span>{{ currentDetail.long_term_memories.length }} 条</span>
+        </div>
+        <div class="actions">
+          <button :disabled="busy" @click="rebuildMemories">重建长期记忆</button>
+        </div>
+        <div class="stack compact">
+          <div class="item-card">
+            <h3>索引说明</h3>
+            <p>当前会把章节、事件、角色状态、快照、伏笔、补丁和评审结果沉淀为统一记忆条目。</p>
+          </div>
+          <div
+            v-for="memory in currentDetail.long_term_memories.slice().reverse().slice(0, 20)"
+            :key="memory.id"
+            class="item-card"
+          >
+            <h3>{{ memory.title || memory.source_type }}</h3>
+            <p>
+              第 {{ memory.chapter_number }} 章 / {{ memory.source_type }} / {{ memory.memory_type }}
+            </p>
+            <p>重要度：{{ memory.importance_score }}</p>
+            <p>{{ memory.content }}</p>
+            <p>关键词：{{ memory.keywords.join('、') || '无' }}</p>
+          </div>
+        </div>
+      </article>
+
+      <article class="panel">
+        <div class="panel-head">
+          <h2>召回轨迹</h2>
+          <span>{{ currentDetail.memory_retrieval_traces.length }} 条</span>
+        </div>
+        <div class="stack compact">
+          <div
+            v-for="trace in currentDetail.memory_retrieval_traces.slice().reverse().slice(0, 12)"
+            :key="trace.id"
+            class="item-card"
+          >
+            <h3>第 {{ trace.chapter_number }} 章 / {{ trace.id }}</h3>
+            <p>Query Terms：{{ trace.query_terms.join('、') || '无' }}</p>
+            <p>命中记录：{{ trace.selected_record_ids.join(', ') || '无' }}</p>
+            <p>{{ trace.created_at }}</p>
+            <ul class="mini-list">
+              <li v-for="hit in trace.hits.slice(0, 5)" :key="`${trace.id}-${hit.record_id}`">
+                第{{ hit.chapter_number }}章 / {{ hit.source_type }} / score={{ hit.retrieval_score }} /
+                {{ hit.matched_terms.join('、') || '无命中词' }}
+              </li>
+            </ul>
           </div>
         </div>
       </article>

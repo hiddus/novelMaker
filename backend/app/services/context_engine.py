@@ -1,5 +1,6 @@
 from app.core.config import get_settings
 from app.schemas.domain import ContextPack
+from app.services.memory import retrieve_long_term_memories
 from app.services.store import store
 
 
@@ -66,14 +67,15 @@ def _dynamic_token_budget(
 ) -> dict[str, int]:
     input_budget = max(2000, total_budget_tokens - output_reserve_tokens)
     story_share = 0.30 if has_plan else 0.35
-    event_share = 0.24
-    state_share = 0.18
-    snapshot_share = 0.14
-    patch_share = 0.14 if patch_count else 0.06
+    event_share = 0.20
+    state_share = 0.16
+    snapshot_share = 0.12
+    memory_share = 0.14
+    patch_share = 0.14 if patch_count else 0.03
     if not patch_count:
-        event_share += 0.04
+        event_share += 0.03
         state_share += 0.02
-        snapshot_share += 0.02
+        snapshot_share += 0.01
 
     return {
         "total_budget_tokens": total_budget_tokens,
@@ -83,6 +85,7 @@ def _dynamic_token_budget(
         "event_tokens": int(input_budget * event_share),
         "character_state_tokens": int(input_budget * state_share),
         "snapshot_tokens": int(input_budget * snapshot_share),
+        "memory_tokens": int(input_budget * memory_share),
         "patch_tokens": int(input_budget * patch_share),
     }
 
@@ -126,6 +129,12 @@ def build_context_pack(project_id: str, chapter_number: int) -> ContextPack:
         if item
     )
     query_keywords = _keyword_candidates(plan_text)
+    memory_hits, memory_trace = retrieve_long_term_memories(
+        project_id,
+        chapter_number=chapter_number,
+        query_text=plan_text,
+        limit=settings.context_max_memories,
+    )
 
     scored_events = sorted(
         (
@@ -286,6 +295,16 @@ def build_context_pack(project_id: str, chapter_number: int) -> ContextPack:
         ),
         _approx_chars_from_tokens(max(240, token_budget["patch_tokens"] // 2)),
     )
+    memory_summary = _truncate(
+        _join_or_default(
+            [
+                f"第{item.chapter_number}章 / {item.source_type} / score={item.retrieval_score} / {item.content}"
+                for item in memory_hits
+            ],
+            "暂无长期记忆命中。",
+        ),
+        _approx_chars_from_tokens(token_budget["memory_tokens"]),
+    )
     event_diagnostics = [
         f"第{item.chapter_number}章 / score={round(score, 1)} / {item.summary}"
         for score, item in scored_events[: settings.context_max_events]
@@ -310,16 +329,22 @@ def build_context_pack(project_id: str, chapter_number: int) -> ContextPack:
         f"{item.status} / 第{item.created_in_chapter}章 / {item.content}"
         for item in open_hooks[:6]
     ]
+    memory_diagnostics = [
+        f"第{item.chapter_number}章 / {item.source_type} / {item.memory_type} / score={item.retrieval_score} / terms={','.join(item.matched_terms[:4]) or '无'}"
+        for item in memory_hits
+    ]
     selection_reasoning = [
         f"query_terms={', '.join(query_keywords[:12]) or '无'}",
         f"selected_events={len(recent_events)} / selected_states={len(recent_character_states)} / selected_snapshots={len(recent_snapshots)} / selected_hooks={len(open_hooks)} / selected_patches={len(open_retcon_patches)}",
         f"snapshot_summary={snapshot_summary}",
+        f"memory_trace={memory_trace.id}",
     ]
     context_summary = (
         f"第 {chapter_number} 章上下文包："
         f"从 {len(events)} 条事件中选出 {len(recent_events)} 条，"
         f"从 {len(character_states)} 条状态中选出 {len(recent_character_states)} 条，"
         f"从 {len(snapshots)} 个快照中选出 {len(recent_snapshots)} 个，"
+        f"长期记忆命中 {len(memory_hits)} 条，"
         f"开放伏笔 {len(open_hooks)} 条，"
         f"开放补丁 {len(open_retcon_patches)} 个。"
     )
@@ -330,6 +355,7 @@ def build_context_pack(project_id: str, chapter_number: int) -> ContextPack:
         story_bible=story_bible,
         recent_events=recent_events,
         active_characters=active_characters,
+        long_term_memories=memory_hits,
         open_hooks=open_hooks,
         recent_character_states=recent_character_states,
         recent_snapshots=recent_snapshots,
@@ -342,14 +368,16 @@ def build_context_pack(project_id: str, chapter_number: int) -> ContextPack:
         event_summary=event_summary,
         character_state_summary=character_state_summary,
         patch_summary=patch_summary,
+        memory_summary=memory_summary,
         token_budget=token_budget,
         retrieval_diagnostics={
             "events": event_diagnostics,
             "character_states": state_diagnostics,
             "snapshots": snapshot_diagnostics,
+            "long_term_memory": memory_diagnostics,
             "open_hooks": hook_diagnostics,
             "patches": patch_diagnostics,
             "characters": character_diagnostics,
         },
-        selection_reasoning=selection_reasoning + [f"hook_summary={hook_summary}"],
+        selection_reasoning=selection_reasoning + [f"hook_summary={hook_summary}", f"memory_summary={memory_summary}"],
     )
