@@ -90,6 +90,53 @@ type CharacterState = {
   note: string
 }
 
+type CharacterRelationshipEdge = {
+  id: string
+  chapter_number: number
+  source_character_id: string
+  target_character_id: string
+  pair_key: string
+  relation_type: 'ally' | 'enemy' | 'mentor' | 'student' | 'lover' | 'family' | 'rival' | 'unknown'
+  direction: 'forward' | 'mutual'
+  change_type: 'new' | 'reinforce' | 'shift' | 'reverse'
+  previous_edge_id?: string | null
+  is_current: boolean
+  intensity: number
+  evidence: string
+  note: string
+}
+
+type TimelineNode = {
+  id: string
+  chapter_number: number
+  chapter_id?: string | null
+  event_id?: string | null
+  label: string
+  location?: string | null
+  previous_location?: string | null
+  participants: string[]
+  time_marker: string
+  predecessor_node_ids: string[]
+  note: string
+}
+
+type TimelineConstraint = {
+  id: string
+  chapter_number: number
+  constraint_type: 'ordering' | 'travel' | 'presence' | 'patch'
+  evolution_key: string
+  previous_constraint_id?: string | null
+  is_current: boolean
+  resolved_in_chapter?: number | null
+  severity: 'low' | 'medium' | 'high'
+  related_node_id?: string | null
+  related_character_id?: string | null
+  description: string
+  evidence: string[]
+  status: 'clear' | 'warning' | 'violated' | 'resolved'
+  recommendation: string
+}
+
 type ExtractedUpdate = {
   id: string
   chapter_number: number
@@ -216,6 +263,45 @@ type VersionRecord = {
   change_summary: string
 }
 
+type StateGraphRepairSuggestion = {
+  title: string
+  detail: string
+  severity: 'warning' | 'critical'
+  recommended_action: 'rerun_projection' | 'rerun_window' | 'manual_review'
+  scheduler_mode: 'recovery' | 'manual'
+  start_chapter?: number | null
+  end_chapter?: number | null
+  target_entity_type: string
+  target_entity_id: string
+  can_create_scheduler_task: boolean
+}
+
+type StateGraphRecoveryPlan = {
+  title: string
+  detail: string
+  severity: 'warning' | 'critical'
+  recommended_action: 'rerun_projection' | 'rerun_window' | 'manual_review'
+  scheduler_mode: 'recovery' | 'manual'
+  start_chapter?: number | null
+  end_chapter?: number | null
+  can_create_scheduler_task: boolean
+  issue_count: number
+  critical_issue_count: number
+  summary_lines: string[]
+  focus_categories: string[]
+}
+
+type StateGraphDiagnostic = {
+  category: 'projection' | 'reference' | 'relationship' | 'timeline' | 'revision'
+  severity: 'warning' | 'critical'
+  chapter_number?: number | null
+  entity_type: string
+  entity_id: string
+  summary: string
+  detail: string
+  repair_suggestion?: StateGraphRepairSuggestion | null
+}
+
 type BatchWriteResult = {
   project_id: string
   start_chapter: number
@@ -275,6 +361,8 @@ type ContextPack = {
   character_state_summary: string
   patch_summary: string
   memory_summary: string
+  relationship_summary: string
+  timeline_summary: string
   token_budget: Record<string, number>
   retrieval_diagnostics: Record<string, string[]>
   selection_reasoning: string[]
@@ -282,6 +370,9 @@ type ContextPack = {
   recent_events: EventItem[]
   active_characters: Character[]
   long_term_memories: MemoryRetrievalHit[]
+  relationship_edges: CharacterRelationshipEdge[]
+  timeline_nodes: TimelineNode[]
+  active_timeline_constraints: TimelineConstraint[]
   recent_character_states: CharacterState[]
   recent_snapshots: Snapshot[]
   open_hooks: HookRecord[]
@@ -306,7 +397,20 @@ type LongTermMemoryRecord = {
   title: string
   content: string
   keywords: string[]
+  term_count: number
   importance_score: number
+}
+
+type MemoryIndexStatus = {
+  project_id: string
+  backend: 'local' | 'qdrant'
+  backend_status: 'ready' | 'degraded' | 'unavailable'
+  ready: boolean
+  indexed_records: number
+  last_indexed_at?: string | null
+  index_location: string
+  collection_name: string
+  detail: string
 }
 
 type MemoryRetrievalHit = {
@@ -317,6 +421,9 @@ type MemoryRetrievalHit = {
   title: string
   content: string
   retrieval_score: number
+  retrieval_backend: 'local' | 'qdrant'
+  vector_score: number
+  lexical_score: number
   matched_terms: string[]
   reasons: string[]
 }
@@ -326,9 +433,29 @@ type MemoryRetrievalTrace = {
   chapter_number: number
   query_text: string
   query_terms: string[]
+  retrieval_backend: 'local' | 'qdrant'
+  backend_status: 'ready' | 'degraded' | 'unavailable'
   selected_record_ids: string[]
   hits: MemoryRetrievalHit[]
   created_at: string
+}
+
+type QueueJob = {
+  id: string
+  project_id: string
+  task_id: string
+  job_type: 'scheduler_task'
+  status: 'pending' | 'leased' | 'completed' | 'failed' | 'cancelled'
+  worker_id?: string | null
+  available_at: string
+  lease_expires_at?: string | null
+  attempt_count: number
+  max_attempts: number
+  payload_summary: string
+  result_summary: string
+  last_error: string
+  created_at: string
+  updated_at: string
 }
 
 type SchedulerTask = {
@@ -347,7 +474,7 @@ type SchedulerTask = {
     | 'governance_blocked'
     | 'completed'
   patch_id?: string | null
-  status: 'pending' | 'running' | 'paused' | 'completed' | 'failed'
+  status: 'pending' | 'queued' | 'running' | 'paused' | 'completed' | 'failed'
   completed_chapters: number[]
   retry_count: number
   max_retries: number
@@ -360,6 +487,22 @@ type SchedulerTask = {
   governance_last_event_id?: string | null
   governance_cost_used_usd: number
   governance_cost_limit_usd: number
+  active_queue_job_id?: string | null
+}
+
+type WorkerStatus = {
+  worker_id: string
+  mode: 'embedded' | 'standalone'
+  is_running: boolean
+  embedded_worker_enabled: boolean
+  started_at?: string | null
+  last_tick_at?: string | null
+  last_claimed_job_id?: string | null
+  active_job_id?: string | null
+  processed_jobs: number
+  failed_jobs: number
+  queue_backlog: number
+  poll_interval_seconds: number
 }
 
 type GovernancePolicy = {
@@ -369,11 +512,13 @@ type GovernancePolicy = {
   max_total_estimated_cost_usd: number
   max_chapter_cost_usd: number
   max_conflict_score: number
+  max_continuing_timeline_risks: number
   min_reader_score: number
   min_review_score: number
   pause_on_review_required: boolean
   pause_on_reader_weak: boolean
   pause_on_state_anomaly: boolean
+  pause_on_continuing_timeline_risk: boolean
   state_anomaly_keywords: string[]
   updated_at?: string
 }
@@ -384,7 +529,7 @@ type GovernanceEvent = {
   policy_id?: string | null
   chapter_number?: number | null
   level: 'info' | 'warning' | 'critical'
-  signal: 'budget' | 'failure' | 'continuity' | 'reader' | 'state' | 'review' | 'manual'
+  signal: 'budget' | 'failure' | 'continuity' | 'reader' | 'state' | 'review' | 'llm' | 'manual'
   action: 'continue' | 'pause' | 'stop'
   summary: string
   details: string[]
@@ -424,12 +569,149 @@ type MetricsSummary = {
   latest_warnings: string[]
 }
 
+type RunOpsSummary = {
+  project_id: string
+  chapter_count: number
+  approved_chapter_count: number
+  review_required_chapter_count: number
+  total_estimated_cost_usd: number
+  budget_limit_usd: number
+  budget_used_ratio: number
+  total_scheduler_tasks: number
+  queued_tasks: number
+  running_tasks: number
+  paused_tasks: number
+  blocked_tasks: number
+  queue_pending_jobs: number
+  queue_leased_jobs: number
+  last_completed_chapter: number
+  average_quality_score_last_10: number
+  average_reader_score_last_10: number
+  average_review_score_last_10: number
+  active_timeline_risk_count: number
+  continuing_timeline_risk_count: number
+  resolved_timeline_risk_count: number
+  timeline_risk_alerts: string[]
+  state_graph_issue_count: number
+  critical_state_graph_issue_count: number
+  state_graph_alerts: string[]
+  pending_retcon_patch_count: number
+  replanned_retcon_patch_count: number
+  patch_alerts: string[]
+  llm_provider: string
+  llm_provider_label: string
+  llm_readiness: 'ready' | 'degraded' | 'blocked'
+  llm_writer_route: 'mock' | 'openai'
+  llm_last_diagnostic_status: 'not_run' | 'skipped' | 'ok' | 'error'
+  llm_last_diagnostic_at?: string | null
+  llm_last_preflight_status: 'not_run' | 'completed' | 'failed'
+  llm_last_preflight_at?: string | null
+  llm_last_preflight_chapter: number
+  llm_recent_preflight_failures: number
+  llm_recent_fallback_runs: number
+  llm_config_issue_count: number
+  llm_connectivity_issue_count: number
+  llm_fallback_issue_count: number
+  llm_preflight_issue_count: number
+  llm_alerts: string[]
+  llm_health_trend: string[]
+  active_stop_reasons: string[]
+  recent_critical_events: string[]
+  recent_task_summaries: string[]
+  warnings: string[]
+  state_graph_recovery_plan?: StateGraphRecoveryPlan | null
+}
+
+type LLMStatus = {
+  provider: string
+  provider_label: string
+  readiness: 'ready' | 'degraded' | 'blocked'
+  writer_route: 'mock' | 'openai'
+  use_mock_writer: boolean
+  api_key_configured: boolean
+  api_key_masked: string
+  base_url: string
+  model: string
+  timeout_seconds: number
+  max_retries: number
+  can_run_live: boolean
+  can_run_auto_mode: boolean
+  detail: string
+  warnings: string[]
+}
+
+type LLMDiagnosticResult = {
+  status: LLMStatus
+  connectivity_status: 'not_run' | 'skipped' | 'ok' | 'error'
+  endpoint: string
+  request_model: string
+  latency_ms: number
+  response_excerpt: string
+  error: string
+  warnings: string[]
+  tested_at: string
+}
+
+type LLMTestRunResult = {
+  status: 'completed' | 'failed'
+  provider: string
+  provider_label: string
+  writer_mode: 'mock' | 'openai'
+  model_name: string
+  latency_ms: number
+  prompt_tokens_estimate: number
+  completion_tokens_estimate: number
+  total_tokens_estimate: number
+  response_text: string
+  detail: string
+  error: string
+  tested_at: string
+}
+
+type LLMChapterPreflightResult = {
+  status: 'completed' | 'failed'
+  project_id: string
+  project_title: string
+  chapter_number: number
+  tone: string
+  provider: string
+  provider_label: string
+  writer_mode_requested: 'auto' | 'mock' | 'openai'
+  writer_mode_resolved: 'mock' | 'openai'
+  fallback_used: boolean
+  model_name: string
+  chapter_plan_found: boolean
+  active_character_count: number
+  recent_event_count: number
+  recent_state_count: number
+  memory_hit_count: number
+  relationship_count: number
+  timeline_node_count: number
+  timeline_constraint_count: number
+  open_hook_count: number
+  open_patch_count: number
+  prompt_chars: number
+  prompt_excerpt: string
+  context_summary: string
+  prompt_tokens_estimate: number
+  completion_tokens_estimate: number
+  total_tokens_estimate: number
+  latency_ms: number
+  response_excerpt: string
+  detail: string
+  error: string
+  tested_at: string
+}
+
 type ProjectDetail = {
   project: Project
   story_bible: StoryBible
   governance_policy?: GovernancePolicy | null
   characters: Character[]
   character_states: CharacterState[]
+  relationship_edges: CharacterRelationshipEdge[]
+  timeline_nodes: TimelineNode[]
+  timeline_constraints: TimelineConstraint[]
   events: EventItem[]
   chapter_plans: ChapterPlan[]
   chapters: ChapterDraft[]
@@ -441,14 +723,19 @@ type ProjectDetail = {
   hook_records: HookRecord[]
   hook_state_changes: HookStateChange[]
   scheduler_tasks: SchedulerTask[]
+  queue_jobs: QueueJob[]
   reviews: ReviewReport[]
   continuity_reports: ContinuityReport[]
   reader_council_reports: ReaderCouncilReport[]
   governance_events: GovernanceEvent[]
   long_term_memories: LongTermMemoryRecord[]
   memory_retrieval_traces: MemoryRetrievalTrace[]
+  memory_index_status?: MemoryIndexStatus | null
   chapter_metrics: ChapterMetric[]
   metrics_summary?: MetricsSummary | null
+  ops_summary?: RunOpsSummary | null
+  state_graph_diagnostics: StateGraphDiagnostic[]
+  state_graph_recovery_plan?: StateGraphRecoveryPlan | null
   latest_run?: WritingRun | null
 }
 
@@ -462,6 +749,14 @@ const busy = ref(false)
 const projects = ref<Project[]>([])
 const currentDetail = ref<ProjectDetail | null>(null)
 const currentContext = ref<ContextPack | null>(null)
+const workerStatus = ref<WorkerStatus | null>(null)
+const llmStatus = ref<LLMStatus | null>(null)
+const llmDiagnostic = ref<LLMDiagnosticResult | null>(null)
+const llmTestRun = ref<LLMTestRunResult | null>(null)
+const llmDiagnostics = ref<LLMDiagnosticResult[]>([])
+const llmTestRuns = ref<LLMTestRunResult[]>([])
+const llmPreflight = ref<LLMChapterPreflightResult | null>(null)
+const llmPreflights = ref<LLMChapterPreflightResult[]>([])
 const lastBatchResult = ref<BatchWriteResult | null>(null)
 const lastRollbackResult = ref<RollbackResult | null>(null)
 const lastRerunResult = ref<BatchWriteResult | null>(null)
@@ -562,12 +857,25 @@ const governanceForm = reactive({
   max_total_estimated_cost_usd: 20,
   max_chapter_cost_usd: 1,
   max_conflict_score: 4,
+  max_continuing_timeline_risks: 1,
   min_reader_score: 6,
   min_review_score: 6,
   pause_on_review_required: true,
   pause_on_reader_weak: true,
   pause_on_state_anomaly: true,
+  pause_on_continuing_timeline_risk: true,
   state_anomaly_keywords: '失控\n失忆\n暴走\n濒死\n死亡\n叛逃\n黑化',
+})
+
+const llmTestForm = reactive({
+  prompt: '请用两句话写一个适合百万字升级流小说的开篇引子。',
+  writer_mode: 'auto' as 'auto' | 'mock' | 'openai',
+})
+
+const llmPreflightForm = reactive({
+  chapter_number: 1,
+  tone: '热血升级',
+  writer_mode: 'auto' as 'auto' | 'mock' | 'openai',
 })
 
 const modules = [
@@ -607,6 +915,38 @@ function splitLines(value: string) {
     .filter(Boolean)
 }
 
+function timelineConstraintStage(constraint: TimelineConstraint) {
+  if (constraint.status === 'resolved') {
+    return constraint.resolved_in_chapter
+      ? `已在第 ${constraint.resolved_in_chapter} 章闭合`
+      : '已闭合'
+  }
+  return constraint.is_current ? '当前约束' : '历史分支'
+}
+
+function timelineConstraintChain(constraint: TimelineConstraint) {
+  return constraint.previous_constraint_id
+    ? `承接 ${constraint.previous_constraint_id}`
+    : '链路起点'
+}
+
+function isChapterCurrentRevision(chapterId: string) {
+  const chapter = currentDetail.value?.chapters.find((item) => item.id === chapterId)
+  return chapter?.is_current ?? false
+}
+
+function isReviewCurrentRevision(review: ReviewReport) {
+  return isChapterCurrentRevision(review.chapter_id)
+}
+
+function isContinuityReportCurrentRevision(report: ContinuityReport) {
+  return isChapterCurrentRevision(report.chapter_id)
+}
+
+function isReaderCouncilReportCurrentRevision(report: ReaderCouncilReport) {
+  return isChapterCurrentRevision(report.chapter_id)
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${apiBase}${path}`, {
     headers: {
@@ -631,16 +971,66 @@ async function loadHealth() {
       version: string
       use_mock_writer: boolean
       worker_running: boolean
+      worker_mode: string
+      queue_backlog: number
     }>('/health')
     health.value = {
       status: 'online',
-      message: `后端在线，版本 ${data.version}，mock writer=${String(data.use_mock_writer)}，worker=${String(data.worker_running)}`,
+      message: `后端在线，版本 ${data.version}，mock writer=${String(data.use_mock_writer)}，worker=${String(data.worker_running)} / mode=${data.worker_mode} / backlog=${data.queue_backlog}`,
     }
   } catch {
     health.value = {
       status: 'offline',
       message: '后端暂不可达，请先启动 FastAPI 服务。',
     }
+  }
+}
+
+async function loadWorkerStatus() {
+  try {
+    workerStatus.value = await request<WorkerStatus>('/worker/status')
+  } catch {
+    workerStatus.value = null
+  }
+}
+
+async function loadLLMStatus() {
+  try {
+    llmStatus.value = await request<LLMStatus>('/llm/status')
+  } catch {
+    llmStatus.value = null
+  }
+}
+
+async function loadLLMHistory() {
+  try {
+    const [diagnostics, testRuns] = await Promise.all([
+      request<LLMDiagnosticResult[]>('/llm/diagnostics'),
+      request<LLMTestRunResult[]>('/llm/test-runs'),
+    ])
+    llmDiagnostics.value = diagnostics.slice().reverse()
+    llmTestRuns.value = testRuns.slice().reverse()
+    llmDiagnostic.value = llmDiagnostics.value[0] ?? null
+    llmTestRun.value = llmTestRuns.value[0] ?? null
+  } catch {
+    llmDiagnostics.value = []
+    llmTestRuns.value = []
+  }
+}
+
+async function loadLLMPreflightHistory(projectId: string) {
+  if (!projectId) {
+    llmPreflight.value = null
+    llmPreflights.value = []
+    return
+  }
+  try {
+    const items = await request<LLMChapterPreflightResult[]>(`/projects/${projectId}/llm/preflights`)
+    llmPreflights.value = items.slice().reverse()
+    llmPreflight.value = llmPreflights.value[0] ?? null
+  } catch {
+    llmPreflight.value = null
+    llmPreflights.value = []
   }
 }
 
@@ -670,6 +1060,7 @@ async function loadProjectDetail(projectId: string) {
       rerunForm.end_chapter = latestChapter.chapter_number + 3
       schedulerForm.start_chapter = latestChapter.chapter_number + 1
       schedulerForm.end_chapter = latestChapter.chapter_number + 5
+      llmPreflightForm.chapter_number = latestChapter.chapter_number + 1
     }
     if (currentDetail.value.retcon_patches.length > 0) {
       const latestPatch =
@@ -683,6 +1074,8 @@ async function loadProjectDetail(projectId: string) {
       currentDetail.value.scheduler_tasks[currentDetail.value.scheduler_tasks.length - 1] ?? null
     syncStoryBibleForm()
     syncGovernanceForm()
+    await loadLLMPreflightHistory(projectId)
+    await loadWorkerStatus()
   } catch (error) {
     banner.value = error instanceof Error ? error.message : '加载项目详情失败'
   }
@@ -699,6 +1092,7 @@ function syncStoryBibleForm() {
   storyBibleForm.core_setting = bible.core_setting.join('\n')
   storyBibleForm.author_intent = bible.author_intent.join('\n')
   writingForm.tone = bible.tone
+  llmPreflightForm.tone = bible.tone
 }
 
 function syncGovernanceForm() {
@@ -709,11 +1103,13 @@ function syncGovernanceForm() {
   governanceForm.max_total_estimated_cost_usd = policy.max_total_estimated_cost_usd
   governanceForm.max_chapter_cost_usd = policy.max_chapter_cost_usd
   governanceForm.max_conflict_score = policy.max_conflict_score
+  governanceForm.max_continuing_timeline_risks = policy.max_continuing_timeline_risks
   governanceForm.min_reader_score = policy.min_reader_score
   governanceForm.min_review_score = policy.min_review_score
   governanceForm.pause_on_review_required = policy.pause_on_review_required
   governanceForm.pause_on_reader_weak = policy.pause_on_reader_weak
   governanceForm.pause_on_state_anomaly = policy.pause_on_state_anomaly
+  governanceForm.pause_on_continuing_timeline_risk = policy.pause_on_continuing_timeline_risk
   governanceForm.state_anomaly_keywords = policy.state_anomaly_keywords.join('\n')
 }
 
@@ -1019,6 +1415,62 @@ async function createSchedulerTask() {
   }
 }
 
+async function applyStateGraphRepairSuggestion(
+  suggestion: StateGraphRepairSuggestion | null | undefined,
+  createNow = false,
+) {
+  if (!suggestion) {
+    banner.value = '当前诊断尚未生成修复建议'
+    return
+  }
+  if (
+    !suggestion.can_create_scheduler_task ||
+    suggestion.scheduler_mode !== 'recovery' ||
+    suggestion.start_chapter == null ||
+    suggestion.end_chapter == null
+  ) {
+    banner.value = suggestion.detail || '该建议需要人工处理，暂不支持直接创建 recovery 任务'
+    return
+  }
+  schedulerForm.mode = 'recovery'
+  schedulerForm.patch_id = ''
+  schedulerForm.start_chapter = suggestion.start_chapter
+  schedulerForm.end_chapter = suggestion.end_chapter
+  schedulerForm.tone = currentDetail.value?.story_bible.tone || activeProject.value?.tone || schedulerForm.tone
+  banner.value = `已载入修复建议：第 ${suggestion.start_chapter} 章 -> 第 ${suggestion.end_chapter} 章`
+  if (createNow) {
+    await createSchedulerTask()
+  }
+}
+
+async function applyStateGraphRecoveryPlan(
+  plan: StateGraphRecoveryPlan | null | undefined,
+  createNow = false,
+) {
+  if (!plan) {
+    banner.value = '当前项目尚未生成批量恢复计划'
+    return
+  }
+  if (
+    !plan.can_create_scheduler_task ||
+    plan.scheduler_mode !== 'recovery' ||
+    plan.start_chapter == null ||
+    plan.end_chapter == null
+  ) {
+    banner.value = plan.detail || '当前恢复计划需要人工处理'
+    return
+  }
+  schedulerForm.mode = 'recovery'
+  schedulerForm.patch_id = ''
+  schedulerForm.start_chapter = plan.start_chapter
+  schedulerForm.end_chapter = plan.end_chapter
+  schedulerForm.tone = currentDetail.value?.story_bible.tone || activeProject.value?.tone || schedulerForm.tone
+  banner.value = `已载入批量恢复计划：第 ${plan.start_chapter} 章 -> 第 ${plan.end_chapter} 章`
+  if (createNow) {
+    await createSchedulerTask()
+  }
+}
+
 async function saveGovernancePolicy() {
   if (!selectedProjectId.value) return
   busy.value = true
@@ -1043,11 +1495,14 @@ async function rebuildMemories() {
   if (!selectedProjectId.value) return
   busy.value = true
   try {
-    await request(`/projects/${selectedProjectId.value}/memories/rebuild`, {
-      method: 'POST',
-    })
+    const status = await request<MemoryIndexStatus>(
+      `/projects/${selectedProjectId.value}/memory-index/rebuild`,
+      {
+        method: 'POST',
+      },
+    )
     await loadProjectDetail(selectedProjectId.value)
-    banner.value = '长期记忆索引已重建'
+    banner.value = `长期记忆索引已重建，backend=${status.backend} / status=${status.backend_status}`
   } catch (error) {
     banner.value = error instanceof Error ? error.message : '重建长期记忆失败'
   } finally {
@@ -1093,9 +1548,85 @@ async function runSchedulerTask() {
   }
 }
 
+async function controlWorker(action: 'start' | 'stop' | 'run-once') {
+  busy.value = true
+  try {
+    workerStatus.value = await request<WorkerStatus>(`/worker/${action}`, {
+      method: 'POST',
+    })
+    await loadHealth()
+    await loadLLMStatus()
+    await loadLLMHistory()
+    if (selectedProjectId.value) {
+      await loadProjectDetail(selectedProjectId.value)
+    }
+    banner.value = `worker 已执行 ${action}`
+  } catch (error) {
+    banner.value = error instanceof Error ? error.message : 'worker 操作失败'
+  } finally {
+    busy.value = false
+  }
+}
+
+async function diagnoseLLM() {
+  busy.value = true
+  try {
+    llmDiagnostic.value = await request<LLMDiagnosticResult>('/llm/diagnose', {
+      method: 'POST',
+    })
+    llmStatus.value = llmDiagnostic.value.status
+    await loadLLMHistory()
+    banner.value = `LLM 连通性探测完成：${llmDiagnostic.value.connectivity_status}`
+  } catch (error) {
+    banner.value = error instanceof Error ? error.message : 'LLM 连通性探测失败'
+  } finally {
+    busy.value = false
+  }
+}
+
+async function runLLMTest() {
+  busy.value = true
+  try {
+    llmTestRun.value = await request<LLMTestRunResult>('/llm/test-run', {
+      method: 'POST',
+      body: JSON.stringify(llmTestForm),
+    })
+    await loadLLMStatus()
+    await loadLLMHistory()
+    banner.value = `LLM 试运行完成：${llmTestRun.value.writer_mode} / ${llmTestRun.value.model_name}`
+  } catch (error) {
+    banner.value = error instanceof Error ? error.message : 'LLM 试运行失败'
+  } finally {
+    busy.value = false
+  }
+}
+
+async function runLLMChapterPreflight() {
+  if (!selectedProjectId.value) return
+  busy.value = true
+  try {
+    llmPreflight.value = await request<LLMChapterPreflightResult>(
+      `/projects/${selectedProjectId.value}/llm/preflight`,
+      {
+        method: 'POST',
+        body: JSON.stringify(llmPreflightForm),
+      },
+    )
+    await loadLLMPreflightHistory(selectedProjectId.value)
+    banner.value = `章节 preflight 完成：第 ${llmPreflight.value.chapter_number} 章 / ${llmPreflight.value.writer_mode_resolved}`
+  } catch (error) {
+    banner.value = error instanceof Error ? error.message : '章节级 preflight 失败'
+  } finally {
+    busy.value = false
+  }
+}
+
 onMounted(async () => {
   await loadHealth()
   if (health.value.status === 'online') {
+    await loadWorkerStatus()
+    await loadLLMStatus()
+    await loadLLMHistory()
     await loadProjects()
   }
 })
@@ -1124,6 +1655,184 @@ onMounted(async () => {
         <span>{{ busy ? '执行中' : '空闲' }}</span>
       </div>
       <p>{{ banner }}</p>
+    </section>
+
+    <section class="grid two-cols">
+      <article class="panel">
+        <div class="panel-head">
+          <h2>Worker 状态</h2>
+          <span>{{ workerStatus?.mode ?? 'unknown' }}</span>
+        </div>
+        <div class="stack compact">
+          <div class="item-card">
+            <h3>{{ workerStatus?.worker_id || '未连接 worker' }}</h3>
+            <p>运行中：{{ workerStatus?.is_running ? 'yes' : 'no' }}</p>
+            <p>嵌入启动：{{ workerStatus?.embedded_worker_enabled ? 'yes' : 'no' }}</p>
+            <p>队列积压：{{ workerStatus?.queue_backlog ?? 0 }}</p>
+            <p>已处理：{{ workerStatus?.processed_jobs ?? 0 }} / 失败：{{ workerStatus?.failed_jobs ?? 0 }}</p>
+            <p>活跃 job：{{ workerStatus?.active_job_id || '无' }}</p>
+            <p>最近认领：{{ workerStatus?.last_claimed_job_id || '无' }}</p>
+            <p>最近 tick：{{ workerStatus?.last_tick_at || '无' }}</p>
+          </div>
+        </div>
+        <div class="actions wrap-actions">
+          <button :disabled="busy" @click="controlWorker('start')">启动嵌入 Worker</button>
+          <button :disabled="busy" @click="controlWorker('run-once')">执行一轮</button>
+          <button :disabled="busy" @click="controlWorker('stop')">停止嵌入 Worker</button>
+        </div>
+      </article>
+
+      <article class="panel">
+        <div class="panel-head">
+          <h2>LLM 诊断</h2>
+          <span>{{ llmStatus?.provider_label ?? 'unknown' }}</span>
+        </div>
+        <div class="stack compact">
+          <div class="item-card">
+            <h3>{{ llmStatus?.provider ?? '未加载 provider' }}</h3>
+            <p>readiness：{{ llmStatus?.readiness ?? 'unknown' }}</p>
+            <p>auto route：{{ llmStatus?.writer_route ?? 'unknown' }}</p>
+            <p>mock writer：{{ llmStatus?.use_mock_writer ? 'yes' : 'no' }}</p>
+            <p>API Key：{{ llmStatus?.api_key_configured ? (llmStatus.api_key_masked || '已配置') : '未配置' }}</p>
+            <p>base_url：{{ llmStatus?.base_url || '无' }}</p>
+            <p>model：{{ llmStatus?.model || '无' }}</p>
+            <p>{{ llmStatus?.detail || '尚未加载 LLM 状态。' }}</p>
+            <ul v-if="llmStatus?.warnings.length" class="mini-list">
+              <li v-for="warning in llmStatus.warnings" :key="warning">{{ warning }}</li>
+            </ul>
+          </div>
+          <label class="full">
+            <span>试运行模式</span>
+            <select v-model="llmTestForm.writer_mode">
+              <option value="auto">auto</option>
+              <option value="mock">mock</option>
+              <option value="openai">openai</option>
+            </select>
+          </label>
+          <label class="full">
+            <span>试运行 Prompt</span>
+            <textarea v-model="llmTestForm.prompt" rows="4" />
+          </label>
+          <label v-if="selectedProjectId" class="full">
+            <span>章节级 Preflight 章节号</span>
+            <input v-model.number="llmPreflightForm.chapter_number" type="number" min="1" />
+          </label>
+          <label v-if="selectedProjectId">
+            <span>Preflight 模式</span>
+            <select v-model="llmPreflightForm.writer_mode">
+              <option value="auto">auto</option>
+              <option value="mock">mock</option>
+              <option value="openai">openai</option>
+            </select>
+          </label>
+          <label v-if="selectedProjectId">
+            <span>Preflight 基调</span>
+            <input v-model="llmPreflightForm.tone" />
+          </label>
+        </div>
+        <div class="actions wrap-actions">
+          <button :disabled="busy" @click="loadLLMStatus">刷新状态</button>
+          <button :disabled="busy" @click="loadLLMHistory">刷新历史</button>
+          <button :disabled="busy" @click="diagnoseLLM">连通性探测</button>
+          <button :disabled="busy" @click="runLLMTest">试运行</button>
+          <button v-if="selectedProjectId" :disabled="busy" @click="runLLMChapterPreflight">
+            章节级 Preflight
+          </button>
+        </div>
+        <div class="stack compact">
+          <div v-if="llmDiagnostic" class="item-card">
+            <h3>最近诊断</h3>
+            <p>状态：{{ llmDiagnostic.connectivity_status }} / latency={{ llmDiagnostic.latency_ms }}ms</p>
+            <p>endpoint：{{ llmDiagnostic.endpoint || '无' }}</p>
+            <p>model：{{ llmDiagnostic.request_model || '无' }}</p>
+            <p>响应摘要：{{ llmDiagnostic.response_excerpt || '无' }}</p>
+            <p v-if="llmDiagnostic.error">错误：{{ llmDiagnostic.error }}</p>
+            <p>时间：{{ llmDiagnostic.tested_at }}</p>
+            <ul v-if="llmDiagnostic.warnings.length" class="mini-list">
+              <li v-for="warning in llmDiagnostic.warnings" :key="warning">{{ warning }}</li>
+            </ul>
+          </div>
+          <div v-if="llmTestRun" class="item-card">
+            <h3>最近试运行</h3>
+            <p>模式：{{ llmTestRun.writer_mode }} / 模型：{{ llmTestRun.model_name }}</p>
+            <p>状态：{{ llmTestRun.status }} / latency={{ llmTestRun.latency_ms }}ms</p>
+            <p>Token：{{ llmTestRun.total_tokens_estimate }} = {{ llmTestRun.prompt_tokens_estimate }} + {{ llmTestRun.completion_tokens_estimate }}</p>
+            <p>{{ llmTestRun.detail }}</p>
+            <p v-if="llmTestRun.error">错误：{{ llmTestRun.error }}</p>
+            <details>
+              <summary>查看试运行输出</summary>
+              <pre>{{ llmTestRun.response_text }}</pre>
+            </details>
+          </div>
+          <div v-if="llmDiagnostics.length > 1" class="item-card">
+            <h3>诊断历史</h3>
+            <ul class="mini-list">
+              <li
+                v-for="item in llmDiagnostics.slice(0, 5)"
+                :key="`${item.tested_at}-${item.connectivity_status}-${item.endpoint}`"
+              >
+                {{ item.tested_at }} / {{ item.connectivity_status }} / {{ item.status.provider }} /
+                {{ item.request_model || 'n/a' }}
+              </li>
+            </ul>
+          </div>
+          <div v-if="llmTestRuns.length > 1" class="item-card">
+            <h3>试运行历史</h3>
+            <ul class="mini-list">
+              <li
+                v-for="item in llmTestRuns.slice(0, 5)"
+                :key="`${item.tested_at}-${item.writer_mode}-${item.model_name}`"
+              >
+                {{ item.tested_at }} / {{ item.writer_mode }} / {{ item.model_name }} /
+                tokens={{ item.total_tokens_estimate }}
+              </li>
+            </ul>
+          </div>
+          <div v-if="llmPreflight" class="item-card">
+            <h3>最近章节级 Preflight</h3>
+            <p>
+              项目：{{ llmPreflight.project_title }} / 第 {{ llmPreflight.chapter_number }} 章 /
+              {{ llmPreflight.writer_mode_resolved }} / {{ llmPreflight.model_name || 'n/a' }}
+            </p>
+            <p>
+              plan={{ llmPreflight.chapter_plan_found ? 'yes' : 'no' }} / latency={{ llmPreflight.latency_ms }}ms /
+              fallback={{ llmPreflight.fallback_used ? 'yes' : 'no' }}
+            </p>
+            <p>
+              context: char={{ llmPreflight.active_character_count }}, event={{ llmPreflight.recent_event_count }},
+              state={{ llmPreflight.recent_state_count }}, memory={{ llmPreflight.memory_hit_count }},
+              rel={{ llmPreflight.relationship_count }}, timeline={{ llmPreflight.timeline_node_count }}
+            </p>
+            <p>
+              hooks={{ llmPreflight.open_hook_count }} / patches={{ llmPreflight.open_patch_count }} /
+              prompt_chars={{ llmPreflight.prompt_chars }} / tokens={{ llmPreflight.total_tokens_estimate }}
+            </p>
+            <p>{{ llmPreflight.context_summary }}</p>
+            <p>{{ llmPreflight.detail }}</p>
+            <p v-if="llmPreflight.error">错误：{{ llmPreflight.error }}</p>
+            <details>
+              <summary>查看 prompt 预览</summary>
+              <pre>{{ llmPreflight.prompt_excerpt }}</pre>
+            </details>
+            <details>
+              <summary>查看输出摘要</summary>
+              <pre>{{ llmPreflight.response_excerpt }}</pre>
+            </details>
+          </div>
+          <div v-if="llmPreflights.length > 1" class="item-card">
+            <h3>章节级 Preflight 历史</h3>
+            <ul class="mini-list">
+              <li
+                v-for="item in llmPreflights.slice(0, 5)"
+                :key="`${item.project_id}-${item.chapter_number}-${item.tested_at}`"
+              >
+                {{ item.tested_at }} / {{ item.project_title }} / ch{{ item.chapter_number }} /
+                {{ item.writer_mode_resolved }} / {{ item.status }}
+              </li>
+            </ul>
+          </div>
+        </div>
+      </article>
     </section>
 
     <section class="grid two-cols top-grid">
@@ -1494,6 +2203,7 @@ onMounted(async () => {
             <h3>{{ activeSchedulerTask.id }}</h3>
             <p>状态：{{ activeSchedulerTask.status }} / stage：{{ activeSchedulerTask.stage }}</p>
             <p>模式：{{ activeSchedulerTask.mode }} {{ activeSchedulerTask.patch_id ? `/ ${activeSchedulerTask.patch_id}` : '' }}</p>
+            <p>队列 Job：{{ activeSchedulerTask.active_queue_job_id || '无' }}</p>
             <p>下一章：{{ activeSchedulerTask.next_chapter }}</p>
             <p>已完成：{{ activeSchedulerTask.completed_chapters.join(', ') || '无' }}</p>
             <p>重试：{{ activeSchedulerTask.retry_count }} / {{ activeSchedulerTask.max_retries }}</p>
@@ -1508,6 +2218,29 @@ onMounted(async () => {
             </p>
             <p>{{ activeSchedulerTask.stage_message || '暂无阶段说明' }}</p>
             <p v-if="activeSchedulerTask.last_error">错误：{{ activeSchedulerTask.last_error }}</p>
+          </div>
+        </div>
+      </article>
+
+      <article class="panel">
+        <div class="panel-head">
+          <h2>执行队列</h2>
+          <span>{{ currentDetail.queue_jobs.length }} 个 job</span>
+        </div>
+        <div class="stack compact">
+          <div
+            v-for="job in currentDetail.queue_jobs.slice().reverse().slice(0, 16)"
+            :key="job.id"
+            class="item-card"
+          >
+            <h3>{{ job.id }}</h3>
+            <p>任务：{{ job.task_id }}</p>
+            <p>状态：{{ job.status }} / worker={{ job.worker_id || '无' }}</p>
+            <p>尝试：{{ job.attempt_count }} / {{ job.max_attempts }}</p>
+            <p>可执行时间：{{ job.available_at }}</p>
+            <p>租约到期：{{ job.lease_expires_at || '无' }}</p>
+            <p>{{ job.payload_summary || '无 payload 说明' }}</p>
+            <p>{{ job.result_summary || job.last_error || '尚无结果' }}</p>
           </div>
         </div>
       </article>
@@ -1698,6 +2431,9 @@ onMounted(async () => {
             <p>角色状态：{{ currentContext.recent_character_states.length }}</p>
             <p>最近快照：{{ currentContext.recent_snapshots.length }}</p>
             <p>长期记忆命中：{{ currentContext.long_term_memories.length }}</p>
+            <p>关系边：{{ currentContext.relationship_edges.length }}</p>
+            <p>时间线节点：{{ currentContext.timeline_nodes.length }}</p>
+            <p>时间线约束：{{ currentContext.active_timeline_constraints.length }}</p>
             <p>开放伏笔：{{ currentContext.open_hooks.length }}</p>
             <p>开放补丁：{{ currentContext.open_retcon_patches.length }}</p>
             <ul class="mini-list">
@@ -1726,6 +2462,12 @@ Retcon Patches:
 Long-Term Memory:
 {{ currentContext.memory_summary }}
 
+Relationships:
+{{ currentContext.relationship_summary }}
+
+Timeline:
+{{ currentContext.timeline_summary }}
+
 Open Hooks:
 {{ currentContext.open_hooks.map((item) => `${item.status} / ${item.content}`).join('\n') || '暂无' }}
 
@@ -1753,6 +2495,30 @@ Token Budget:
                     >
                       第{{ memory.chapter_number }}章 / {{ memory.source_type }} /
                       score={{ memory.retrieval_score }} / {{ memory.content }}
+                    </li>
+                  </ul>
+                </div>
+                <div v-if="currentContext.relationship_edges.length" class="item-card">
+                  <h3>关系边命中</h3>
+                  <ul class="mini-list">
+                    <li v-for="edge in currentContext.relationship_edges" :key="edge.id">
+                      第{{ edge.chapter_number }}章 / {{ edge.source_character_id }} -> {{ edge.target_character_id }} /
+                      {{ edge.relation_type }} / {{ edge.change_type }} / current={{ edge.is_current ? 'yes' : 'no' }} /
+                      {{ edge.evidence }}
+                    </li>
+                  </ul>
+                </div>
+                <div v-if="currentContext.timeline_nodes.length || currentContext.active_timeline_constraints.length" class="item-card">
+                  <h3>时间线命中</h3>
+                  <ul class="mini-list">
+                    <li v-for="node in currentContext.timeline_nodes" :key="node.id">
+                      第{{ node.chapter_number }}章 / {{ node.time_marker }} / {{ node.label }}
+                    </li>
+                    <li v-for="constraint in currentContext.active_timeline_constraints" :key="constraint.id">
+                      约束 / 第{{ constraint.chapter_number }}章 / {{ constraint.status }} /
+                      {{ constraint.is_current ? 'current' : 'history' }} /
+                      {{ constraint.previous_constraint_id ? `承接 ${constraint.previous_constraint_id}` : '链路起点' }} /
+                      {{ constraint.description }}
                     </li>
                   </ul>
                 </div>
@@ -1821,6 +2587,7 @@ Token Budget:
               第 {{ review.chapter_number }} 章 / 自动 {{ review.status }} / 人工
               {{ review.human_decision_status }}
             </h3>
+            <p>修订态：{{ isReviewCurrentRevision(review) ? 'current' : 'stale' }}</p>
             <p>{{ review.decision_reason }}</p>
             <p>连续性报告：{{ review.continuity_report_id || '无' }}</p>
             <p>读者评议：{{ review.reader_council_report_id || '无' }}</p>
@@ -1830,11 +2597,16 @@ Token Budget:
             </p>
             <p>总评：{{ review.overall_score }}</p>
             <p v-if="review.human_decision_note">人工备注：{{ review.human_decision_note }}</p>
+            <p v-if="!isReviewCurrentRevision(review)">该评审对应旧版本章节，已禁止继续审批或重写。</p>
             <ul class="mini-list">
               <li v-for="finding in review.findings" :key="finding">{{ finding }}</li>
             </ul>
             <div
-              v-if="review.status === 'review_required' && review.human_decision_status === 'pending'"
+              v-if="
+                review.status === 'review_required' &&
+                review.human_decision_status === 'pending' &&
+                isReviewCurrentRevision(review)
+              "
               class="actions wrap-actions"
             >
               <button :disabled="busy" @click="rewriteChapter(review.id)">自动重写</button>
@@ -1863,6 +2635,8 @@ Token Budget:
             class="item-card"
           >
             <h3>第 {{ report.chapter_number }} 章 / {{ report.status }}</h3>
+            <p>修订态：{{ isContinuityReportCurrentRevision(report) ? 'current' : 'stale' }}</p>
+            <p v-if="!isContinuityReportCurrentRevision(report)">该连续性报告对应旧版本章节，仅保留作历史审计参考。</p>
             <p>风险：{{ report.overall_risk }}</p>
             <p>Judge：{{ report.judges_triggered.join(' / ') || '无' }}</p>
             <p>{{ report.summary }}</p>
@@ -1889,6 +2663,96 @@ Token Budget:
     <section v-if="currentDetail" class="grid two-cols">
       <article class="panel">
         <div class="panel-head">
+          <h2>角色关系图谱</h2>
+          <span>{{ currentDetail.relationship_edges.length }} 条边</span>
+        </div>
+        <div class="stack compact">
+          <div class="item-card">
+            <h3>当前关系态</h3>
+            <ul class="mini-list">
+              <li
+                v-for="edge in currentDetail.relationship_edges.filter((item) => item.is_current).slice().reverse().slice(0, 10)"
+                :key="`current-${edge.id}`"
+              >
+                {{ edge.source_character_id }} -> {{ edge.target_character_id }} / {{ edge.relation_type }} /
+                {{ edge.change_type }} / 强度 {{ edge.intensity }}
+              </li>
+            </ul>
+          </div>
+          <div
+            v-for="edge in currentDetail.relationship_edges.slice().reverse().slice(0, 20)"
+            :key="edge.id"
+            class="item-card"
+          >
+            <h3>{{ edge.source_character_id }} -> {{ edge.target_character_id }}</h3>
+            <p>
+              第 {{ edge.chapter_number }} 章 / {{ edge.relation_type }} / {{ edge.direction }} /
+              {{ edge.change_type }} / {{ edge.is_current ? 'current' : 'history' }}
+            </p>
+            <p>强度：{{ edge.intensity }}</p>
+            <p>前序边：{{ edge.previous_edge_id || '无' }}</p>
+            <p>{{ edge.evidence }}</p>
+            <p>{{ edge.note || '无备注' }}</p>
+          </div>
+        </div>
+      </article>
+
+      <article class="panel">
+        <div class="panel-head">
+          <h2>时间线约束</h2>
+          <span>{{ currentDetail.timeline_constraints.length }} 条</span>
+        </div>
+        <div class="stack compact">
+          <div class="item-card">
+            <h3>约束演化概览</h3>
+            <p>
+              当前态：
+              {{ currentDetail.timeline_constraints.filter((item) => item.is_current).length }} /
+              已闭合：{{ currentDetail.timeline_constraints.filter((item) => item.status === 'resolved').length }}
+            </p>
+            <p>
+              活跃风险：
+              {{
+                currentDetail.timeline_constraints.filter(
+                  (item) => item.is_current && ['warning', 'violated'].includes(item.status),
+                ).length
+              }}
+              / 历史链：
+              {{ currentDetail.timeline_constraints.filter((item) => item.previous_constraint_id).length }}
+            </p>
+          </div>
+          <div
+            v-for="node in currentDetail.timeline_nodes.slice().reverse().slice(0, 12)"
+            :key="node.id"
+            class="item-card"
+          >
+            <h3>{{ node.time_marker }} / 第 {{ node.chapter_number }} 章</h3>
+            <p>{{ node.label }}</p>
+            <p>上一地点：{{ node.previous_location || '无' }}</p>
+            <p>地点：{{ node.location || '未知' }}</p>
+            <p>参与者：{{ node.participants.join('、') || '无' }}</p>
+          </div>
+          <div
+            v-for="constraint in currentDetail.timeline_constraints.slice().reverse().slice(0, 12)"
+            :key="constraint.id"
+            class="item-card"
+          >
+            <h3>{{ constraint.constraint_type }} / {{ constraint.status }} / {{ constraint.severity }}</h3>
+            <p>第 {{ constraint.chapter_number }} 章</p>
+            <p>{{ timelineConstraintStage(constraint) }} / {{ timelineConstraintChain(constraint) }}</p>
+            <p>相关节点：{{ constraint.related_node_id || '无' }} / 角色：{{ constraint.related_character_id || '无' }}</p>
+            <p>演化键：{{ constraint.evolution_key || '无' }}</p>
+            <p>{{ constraint.description }}</p>
+            <p>证据：{{ constraint.evidence.join('；') || '无' }}</p>
+            <p>建议：{{ constraint.recommendation || '无' }}</p>
+          </div>
+        </div>
+      </article>
+    </section>
+
+    <section v-if="currentDetail" class="grid two-cols">
+      <article class="panel">
+        <div class="panel-head">
           <h2>Reader Council</h2>
           <span>{{ currentDetail.reader_council_reports.length }} 条</span>
         </div>
@@ -1899,6 +2763,8 @@ Token Budget:
             class="item-card"
           >
             <h3>第 {{ report.chapter_number }} 章 / {{ report.status }}</h3>
+            <p>修订态：{{ isReaderCouncilReportCurrentRevision(report) ? 'current' : 'stale' }}</p>
+            <p v-if="!isReaderCouncilReportCurrentRevision(report)">该读者反馈对应旧版本章节，仅保留作历史审计参考。</p>
             <p>
               综合 {{ report.overall_score }} / 追读 {{ report.chase_score }} / 回报
               {{ report.payoff_score }} / 节奏 {{ report.pace_score }}
@@ -2042,6 +2908,10 @@ Token Budget:
             <input v-model.number="governanceForm.max_conflict_score" type="number" min="0" step="0.5" />
           </label>
           <label>
+            <span>延续时间线风险阈值</span>
+            <input v-model.number="governanceForm.max_continuing_timeline_risks" type="number" min="1" />
+          </label>
+          <label>
             <span>最小读者分</span>
             <input v-model.number="governanceForm.min_reader_score" type="number" min="0" max="10" step="0.5" />
           </label>
@@ -2060,6 +2930,10 @@ Token Budget:
           <label>
             <span>状态异常即暂停</span>
             <input v-model="governanceForm.pause_on_state_anomaly" type="checkbox" />
+          </label>
+          <label>
+            <span>延续时间线风险即暂停</span>
+            <input v-model="governanceForm.pause_on_continuing_timeline_risk" type="checkbox" />
           </label>
           <label class="full">
             <span>状态异常关键词</span>
@@ -2118,6 +2992,15 @@ Token Budget:
           <div class="item-card">
             <h3>索引说明</h3>
             <p>当前会把章节、事件、角色状态、快照、伏笔、补丁和评审结果沉淀为统一记忆条目。</p>
+            <p>
+              检索后端：{{ currentDetail.memory_index_status?.backend ?? 'unknown' }} /
+              {{ currentDetail.memory_index_status?.backend_status ?? 'unavailable' }}
+            </p>
+            <p>索引就绪：{{ currentDetail.memory_index_status?.ready ? 'yes' : 'no' }}</p>
+            <p>已索引记录：{{ currentDetail.memory_index_status?.indexed_records ?? 0 }}</p>
+            <p>最近建索引：{{ currentDetail.memory_index_status?.last_indexed_at || '无' }}</p>
+            <p>集合：{{ currentDetail.memory_index_status?.collection_name || '无' }}</p>
+            <p>{{ currentDetail.memory_index_status?.detail || '尚未生成检索状态说明。' }}</p>
           </div>
           <div
             v-for="memory in currentDetail.long_term_memories.slice().reverse().slice(0, 20)"
@@ -2129,6 +3012,7 @@ Token Budget:
               第 {{ memory.chapter_number }} 章 / {{ memory.source_type }} / {{ memory.memory_type }}
             </p>
             <p>重要度：{{ memory.importance_score }}</p>
+            <p>Term 数：{{ memory.term_count }}</p>
             <p>{{ memory.content }}</p>
             <p>关键词：{{ memory.keywords.join('、') || '无' }}</p>
           </div>
@@ -2147,12 +3031,14 @@ Token Budget:
             class="item-card"
           >
             <h3>第 {{ trace.chapter_number }} 章 / {{ trace.id }}</h3>
+            <p>后端：{{ trace.retrieval_backend }} / 状态：{{ trace.backend_status }}</p>
             <p>Query Terms：{{ trace.query_terms.join('、') || '无' }}</p>
             <p>命中记录：{{ trace.selected_record_ids.join(', ') || '无' }}</p>
             <p>{{ trace.created_at }}</p>
             <ul class="mini-list">
               <li v-for="hit in trace.hits.slice(0, 5)" :key="`${trace.id}-${hit.record_id}`">
-                第{{ hit.chapter_number }}章 / {{ hit.source_type }} / score={{ hit.retrieval_score }} /
+                第{{ hit.chapter_number }}章 / {{ hit.source_type }} / {{ hit.retrieval_backend }} /
+                score={{ hit.retrieval_score }} / vector={{ hit.vector_score }} / lexical={{ hit.lexical_score }} /
                 {{ hit.matched_terms.join('、') || '无命中词' }}
               </li>
             </ul>
@@ -2162,6 +3048,204 @@ Token Budget:
     </section>
 
     <section v-if="currentDetail" class="grid two-cols">
+      <article class="panel">
+        <div class="panel-head">
+          <h2>运行评估总览</h2>
+          <span>批量执行与停机信号</span>
+        </div>
+        <div v-if="currentDetail.ops_summary" class="stats-grid">
+          <div class="stat-card">
+            <strong>{{ currentDetail.ops_summary.chapter_count }}</strong>
+            <span>当前章节数</span>
+          </div>
+          <div class="stat-card">
+            <strong>{{ currentDetail.ops_summary.last_completed_chapter }}</strong>
+            <span>最新完成章节</span>
+          </div>
+          <div class="stat-card">
+            <strong>{{ currentDetail.ops_summary.review_required_chapter_count }}</strong>
+            <span>待审核章节</span>
+          </div>
+          <div class="stat-card">
+            <strong>{{ currentDetail.ops_summary.total_scheduler_tasks }}</strong>
+            <span>调度任务总数</span>
+          </div>
+          <div class="stat-card">
+            <strong>{{ currentDetail.ops_summary.queued_tasks }}</strong>
+            <span>排队任务</span>
+          </div>
+          <div class="stat-card">
+            <strong>{{ currentDetail.ops_summary.running_tasks }}</strong>
+            <span>运行任务</span>
+          </div>
+          <div class="stat-card">
+            <strong>{{ currentDetail.ops_summary.blocked_tasks }}</strong>
+            <span>治理阻断任务</span>
+          </div>
+          <div class="stat-card">
+            <strong>{{ currentDetail.ops_summary.queue_pending_jobs }}</strong>
+            <span>待认领 Job</span>
+          </div>
+          <div class="stat-card">
+            <strong>{{ currentDetail.ops_summary.queue_leased_jobs }}</strong>
+            <span>租约中 Job</span>
+          </div>
+          <div class="stat-card">
+            <strong>{{ currentDetail.ops_summary.budget_limit_usd > 0 ? `${Math.round(currentDetail.ops_summary.budget_used_ratio * 100)}%` : '0%' }}</strong>
+            <span>预算使用率</span>
+          </div>
+          <div class="stat-card">
+            <strong>{{ currentDetail.ops_summary.average_quality_score_last_10 }}</strong>
+            <span>最近 10 章质量</span>
+          </div>
+          <div class="stat-card">
+            <strong>{{ currentDetail.ops_summary.average_reader_score_last_10 }}</strong>
+            <span>最近 10 章读者分</span>
+          </div>
+          <div class="stat-card">
+            <strong>{{ currentDetail.ops_summary.active_timeline_risk_count }}</strong>
+            <span>活跃时间线风险</span>
+          </div>
+          <div class="stat-card">
+            <strong>{{ currentDetail.ops_summary.continuing_timeline_risk_count }}</strong>
+            <span>延续型风险</span>
+          </div>
+          <div class="stat-card">
+            <strong>{{ currentDetail.ops_summary.resolved_timeline_risk_count }}</strong>
+            <span>已闭合时间线风险</span>
+          </div>
+          <div class="stat-card">
+            <strong>{{ currentDetail.ops_summary.state_graph_issue_count }}</strong>
+            <span>状态图谱问题数</span>
+          </div>
+          <div class="stat-card">
+            <strong>{{ currentDetail.ops_summary.critical_state_graph_issue_count }}</strong>
+            <span>关键断链问题</span>
+          </div>
+          <div class="stat-card">
+            <strong>
+              {{
+                currentDetail.ops_summary.state_graph_recovery_plan
+                  ? `${currentDetail.ops_summary.state_graph_recovery_plan.start_chapter || 'n/a'} -> ${currentDetail.ops_summary.state_graph_recovery_plan.end_chapter || 'n/a'}`
+                  : '暂无'
+              }}
+            </strong>
+            <span>建议 Recovery 窗口</span>
+          </div>
+          <div class="stat-card">
+            <strong>{{ currentDetail.ops_summary.pending_retcon_patch_count }}</strong>
+            <span>开放补丁数</span>
+          </div>
+          <div class="stat-card">
+            <strong>{{ currentDetail.ops_summary.replanned_retcon_patch_count }}</strong>
+            <span>待 Rerun 补丁</span>
+          </div>
+          <div class="stat-card">
+            <strong>{{ currentDetail.ops_summary.llm_readiness }}</strong>
+            <span>LLM 就绪状态</span>
+          </div>
+          <div class="stat-card">
+            <strong>{{ currentDetail.ops_summary.llm_writer_route }}</strong>
+            <span>Auto 路由</span>
+          </div>
+          <div class="stat-card">
+            <strong>{{ currentDetail.ops_summary.llm_last_diagnostic_status }}</strong>
+            <span>最近诊断</span>
+          </div>
+          <div class="stat-card">
+            <strong>{{ currentDetail.ops_summary.llm_last_preflight_status }}</strong>
+            <span>最近 Preflight</span>
+          </div>
+          <div class="stat-card">
+            <strong>{{ currentDetail.ops_summary.llm_recent_preflight_failures }}</strong>
+            <span>近期 Preflight 失败</span>
+          </div>
+          <div class="stat-card">
+            <strong>{{ currentDetail.ops_summary.llm_recent_fallback_runs }}</strong>
+            <span>近期 Fallback</span>
+          </div>
+          <div class="stat-card">
+            <strong>{{ currentDetail.ops_summary.llm_config_issue_count }}</strong>
+            <span>配置风险桶</span>
+          </div>
+          <div class="stat-card">
+            <strong>{{ currentDetail.ops_summary.llm_connectivity_issue_count }}</strong>
+            <span>连通性风险桶</span>
+          </div>
+          <div class="stat-card">
+            <strong>{{ currentDetail.ops_summary.llm_fallback_issue_count }}</strong>
+            <span>Fallback 风险桶</span>
+          </div>
+          <div class="stat-card">
+            <strong>{{ currentDetail.ops_summary.llm_preflight_issue_count }}</strong>
+            <span>Preflight 风险桶</span>
+          </div>
+          <div class="stat-card full">
+            <strong>活跃停机原因</strong>
+            <span>{{ currentDetail.ops_summary.active_stop_reasons.join('；') || '暂无' }}</span>
+          </div>
+          <div class="stat-card full">
+            <strong>近期关键事件</strong>
+            <span>{{ currentDetail.ops_summary.recent_critical_events.join('；') || '暂无' }}</span>
+          </div>
+          <div class="stat-card full">
+            <strong>补丁风险</strong>
+            <span>{{ currentDetail.ops_summary.patch_alerts.join('；') || '暂无' }}</span>
+          </div>
+          <div class="stat-card full">
+            <strong>时间线风险链</strong>
+            <span>{{ currentDetail.ops_summary.timeline_risk_alerts.join('；') || '暂无' }}</span>
+          </div>
+          <div class="stat-card full">
+            <strong>状态图谱巡检</strong>
+            <span>{{ currentDetail.ops_summary.state_graph_alerts.join('；') || '暂无' }}</span>
+          </div>
+          <div
+            v-if="currentDetail.ops_summary.state_graph_recovery_plan"
+            class="stat-card full"
+          >
+            <strong>状态图谱批量恢复</strong>
+            <span>
+              {{ currentDetail.ops_summary.state_graph_recovery_plan.title }}；
+              {{ currentDetail.ops_summary.state_graph_recovery_plan.detail }}
+            </span>
+            <span>
+              聚焦：{{ currentDetail.ops_summary.state_graph_recovery_plan.focus_categories.join(' / ') || '暂无' }}；
+              问题：{{ currentDetail.ops_summary.state_graph_recovery_plan.issue_count }} 条 /
+              critical {{ currentDetail.ops_summary.state_graph_recovery_plan.critical_issue_count }} 条
+            </span>
+            <span>
+              {{ currentDetail.ops_summary.state_graph_recovery_plan.summary_lines.join('；') || '暂无摘要' }}
+            </span>
+            <div
+              v-if="currentDetail.ops_summary.state_graph_recovery_plan.can_create_scheduler_task"
+              class="actions wrap-actions"
+            >
+              <button
+                :disabled="busy"
+                @click="applyStateGraphRecoveryPlan(currentDetail.ops_summary.state_graph_recovery_plan)"
+              >
+                载入批量恢复
+              </button>
+              <button
+                :disabled="busy"
+                @click="applyStateGraphRecoveryPlan(currentDetail.ops_summary.state_graph_recovery_plan, true)"
+              >
+                创建批量 recovery
+              </button>
+            </div>
+          </div>
+          <div class="stat-card full">
+            <strong>LLM 告警</strong>
+            <span>{{ currentDetail.ops_summary.llm_alerts.join('；') || '暂无' }}</span>
+          </div>
+          <div class="stat-card full">
+            <strong>LLM 健康趋势</strong>
+            <span>{{ currentDetail.ops_summary.llm_health_trend.join('；') || '暂无' }}</span>
+          </div>
+        </div>
+      </article>
+
       <article class="panel">
         <div class="panel-head">
           <h2>成本与质量</h2>
@@ -2201,6 +3285,10 @@ Token Budget:
             <span>降级次数</span>
           </div>
           <div class="stat-card">
+            <strong>{{ currentDetail.ops_summary?.llm_last_preflight_chapter ?? 0 }}</strong>
+            <span>最近 Preflight 章节</span>
+          </div>
+          <div class="stat-card">
             <strong>{{ currentDetail.metrics_summary.open_hook_count }}</strong>
             <span>开放伏笔数</span>
           </div>
@@ -2218,6 +3306,110 @@ Token Budget:
               {{ currentDetail.metrics_summary.latest_warnings.join('；') || '暂无' }}
             </span>
           </div>
+          <div class="stat-card full">
+            <strong>最近 LLM 探测时间</strong>
+            <span>
+              {{ currentDetail.ops_summary?.llm_last_diagnostic_at || currentDetail.ops_summary?.llm_last_preflight_at || '暂无' }}
+            </span>
+          </div>
+          <div class="stat-card full">
+            <strong>LLM 风险摘要</strong>
+            <span>
+              {{
+                currentDetail.ops_summary
+                  ? `config=${currentDetail.ops_summary.llm_config_issue_count}；connectivity=${currentDetail.ops_summary.llm_connectivity_issue_count}；fallback=${currentDetail.ops_summary.llm_fallback_issue_count}；preflight=${currentDetail.ops_summary.llm_preflight_issue_count}`
+                  : '暂无'
+              }}
+            </span>
+          </div>
+        </div>
+      </article>
+
+      <article class="panel">
+        <div class="panel-head">
+          <h2>状态图谱巡检</h2>
+          <span>{{ currentDetail.state_graph_diagnostics.length }} 条</span>
+        </div>
+        <div class="stack compact">
+          <div v-if="currentDetail.state_graph_recovery_plan" class="item-card">
+            <h3>批量恢复计划</h3>
+            <p>{{ currentDetail.state_graph_recovery_plan.title }}</p>
+            <p>{{ currentDetail.state_graph_recovery_plan.detail }}</p>
+            <p>
+              问题：{{ currentDetail.state_graph_recovery_plan.issue_count }} 条 /
+              critical：{{ currentDetail.state_graph_recovery_plan.critical_issue_count }} 条
+            </p>
+            <p>
+              动作：{{ currentDetail.state_graph_recovery_plan.recommended_action }} /
+              窗口：{{ currentDetail.state_graph_recovery_plan.start_chapter ?? 'n/a' }} ->
+              {{ currentDetail.state_graph_recovery_plan.end_chapter ?? 'n/a' }}
+            </p>
+            <p>
+              重点类别：{{ currentDetail.state_graph_recovery_plan.focus_categories.join(' / ') || '无' }}
+            </p>
+            <p>
+              摘要：{{ currentDetail.state_graph_recovery_plan.summary_lines.join('；') || '无' }}
+            </p>
+            <div
+              v-if="currentDetail.state_graph_recovery_plan.can_create_scheduler_task"
+              class="actions wrap-actions"
+            >
+              <button
+                :disabled="busy"
+                @click="applyStateGraphRecoveryPlan(currentDetail.state_graph_recovery_plan)"
+              >
+                载入批量恢复
+              </button>
+              <button
+                :disabled="busy"
+                @click="applyStateGraphRecoveryPlan(currentDetail.state_graph_recovery_plan, true)"
+              >
+                创建批量 recovery
+              </button>
+            </div>
+          </div>
+          <div v-if="currentDetail.state_graph_diagnostics.length === 0" class="item-card">
+            <h3>当前无断链</h3>
+            <p>current revision、图谱、时间线、快照与版本引用未发现显式不一致。</p>
+          </div>
+          <div
+            v-for="item in currentDetail.state_graph_diagnostics"
+            :key="`${item.category}-${item.entity_type}-${item.entity_id}-${item.summary}`"
+            class="item-card"
+          >
+            <h3>{{ item.severity }} / {{ item.category }}</h3>
+            <p>章节：{{ item.chapter_number ?? 'n/a' }} / 实体：{{ item.entity_type || 'unknown' }}</p>
+            <p>ID：{{ item.entity_id || '无' }}</p>
+            <p>{{ item.summary }}</p>
+            <p>{{ item.detail || '无补充说明' }}</p>
+            <div v-if="item.repair_suggestion" class="item-card">
+              <h3>修复建议</h3>
+              <p>{{ item.repair_suggestion.title }}</p>
+              <p>{{ item.repair_suggestion.detail || '无补充说明' }}</p>
+              <p>
+                动作：{{ item.repair_suggestion.recommended_action }} /
+                窗口：{{ item.repair_suggestion.start_chapter ?? 'n/a' }} ->
+                {{ item.repair_suggestion.end_chapter ?? 'n/a' }}
+              </p>
+              <div
+                v-if="item.repair_suggestion.can_create_scheduler_task"
+                class="actions wrap-actions"
+              >
+                <button
+                  :disabled="busy"
+                  @click="applyStateGraphRepairSuggestion(item.repair_suggestion)"
+                >
+                  载入到调度器
+                </button>
+                <button
+                  :disabled="busy"
+                  @click="applyStateGraphRepairSuggestion(item.repair_suggestion, true)"
+                >
+                  创建 recovery 任务
+                </button>
+              </div>
+            </div>
+          </div>
         </div>
       </article>
 
@@ -2227,6 +3419,17 @@ Token Budget:
           <span>{{ currentDetail.chapter_metrics.length }} 条</span>
         </div>
         <div class="stack compact">
+          <div v-if="currentDetail.ops_summary" class="item-card">
+            <h3>批量执行观察</h3>
+            <p>预算：{{ currentDetail.ops_summary.total_estimated_cost_usd }} / {{ currentDetail.ops_summary.budget_limit_usd }} USD</p>
+            <p>最近告警：{{ currentDetail.ops_summary.warnings.join('；') || '暂无' }}</p>
+            <p v-if="currentDetail.ops_summary.state_graph_recovery_plan">
+              恢复建议：{{ currentDetail.ops_summary.state_graph_recovery_plan.title }}
+            </p>
+            <ul class="mini-list">
+              <li v-for="item in currentDetail.ops_summary.recent_task_summaries" :key="item">{{ item }}</li>
+            </ul>
+          </div>
           <div
             v-for="metric in currentDetail.chapter_metrics.slice().reverse()"
             :key="metric.id"

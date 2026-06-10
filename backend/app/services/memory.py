@@ -1,44 +1,21 @@
 from __future__ import annotations
 
-import re
 from collections.abc import Iterable
 
 from app.core.config import get_settings
 from app.schemas.domain import (
     LongTermMemoryRecord,
+    MemoryIndexStatus,
     MemoryRetrievalHit,
     MemoryRetrievalTrace,
 )
+from app.services.retrieval_features import extract_memory_terms, normalize_text
 from app.services.store import store
-
-_SEPARATORS = re.compile(r"[\s，。；：、,:;()\[\]（）【】\-_/]+")
-
-
-def _normalize(text: str) -> str:
-    return " ".join(text.strip().split())
-
-
-def _split_terms(text: str) -> list[str]:
-    tokens = [item.strip() for item in _SEPARATORS.split(text) if len(item.strip()) >= 2]
-    return list(dict.fromkeys(tokens))
-
-
-def _char_ngrams(text: str, size: int = 2) -> list[str]:
-    compact = "".join(ch for ch in text if not ch.isspace())
-    if len(compact) < size:
-        return []
-    return [compact[index : index + size] for index in range(len(compact) - size + 1)]
-
-
-def extract_memory_terms(*parts: str) -> list[str]:
-    items: list[str] = []
-    for part in parts:
-        normalized = _normalize(part)
-        if not normalized:
-            continue
-        items.extend(_split_terms(normalized))
-        items.extend(_char_ngrams(normalized, size=2))
-    return list(dict.fromkeys(item for item in items if len(item) >= 2))
+from app.services.vector_retrieval import (
+    get_memory_index_status as get_vector_index_status,
+    rebuild_memory_index,
+    search_memory_records,
+)
 
 
 def _memory_record(
@@ -60,8 +37,9 @@ def _memory_record(
         chapter_number=chapter_number,
         memory_type=memory_type,  # type: ignore[arg-type]
         title=title,
-        content=_normalize(content),
+        content=normalize_text(content),
         keywords=list(dict.fromkeys(item for item in keywords if item)),
+        term_count=len(list(dict.fromkeys(item for item in keywords if item))),
         importance_score=round(importance_score, 2),
     )
 
@@ -73,9 +51,9 @@ def rebuild_long_term_memory(project_id: str) -> list[LongTermMemoryRecord]:
     snapshots = store.list_snapshots(project_id)
     hooks = store.list_hook_records(project_id)
     patches = store.list_retcon_patches(project_id)
-    reviews = store.list_reviews(project_id)
-    continuity_reports = store.list_continuity_reports(project_id)
-    reader_reports = store.list_reader_council_reports(project_id)
+    reviews = store.list_current_reviews(project_id)
+    continuity_reports = store.list_current_continuity_reports(project_id)
+    reader_reports = store.list_current_reader_council_reports(project_id)
 
     records: list[LongTermMemoryRecord] = []
 
@@ -245,7 +223,13 @@ def rebuild_long_term_memory(project_id: str) -> list[LongTermMemoryRecord]:
         key=lambda item: (item.chapter_number, item.importance_score, item.updated_at),
         reverse=False,
     )
-    return store.replace_long_term_memories(project_id, records)
+    stored_records = store.replace_long_term_memories(project_id, records)
+    rebuild_memory_index(project_id, stored_records)
+    return stored_records
+
+
+def get_memory_index_status(project_id: str) -> MemoryIndexStatus:
+    return get_vector_index_status(project_id)
 
 
 def retrieve_long_term_memories(
@@ -258,48 +242,20 @@ def retrieve_long_term_memories(
     settings = get_settings()
     limit = limit or settings.context_max_memories
     records = rebuild_long_term_memory(project_id)
-    query_terms = extract_memory_terms(query_text)
-
-    scored: list[tuple[float, LongTermMemoryRecord, list[str]]] = []
-    for record in records:
-        if record.chapter_number > chapter_number:
-            continue
-        matched_terms = [term for term in query_terms if term in record.content or term in record.keywords]
-        overlap = float(len(matched_terms))
-        keyword_overlap = float(len(set(query_terms) & set(record.keywords)))
-        recency = max(0.0, 10 - abs(chapter_number - record.chapter_number) * 0.8)
-        score = overlap * 2.4 + keyword_overlap * 1.6 + recency + record.importance_score
-        if record.memory_type in {"foreshadow", "risk"}:
-            score += 0.8
-        if score <= record.importance_score + 0.5:
-            continue
-        reasons = [
-            f"matched_terms={', '.join(matched_terms[:6]) or '无'}",
-            f"recency={round(recency, 1)}",
-            f"importance={record.importance_score}",
-        ]
-        scored.append((round(score, 2), record, reasons))
-
-    scored.sort(key=lambda item: (item[0], item[1].chapter_number, item[1].importance_score), reverse=True)
-    hits = [
-        MemoryRetrievalHit(
-            record_id=record.id,
-            chapter_number=record.chapter_number,
-            source_type=record.source_type,
-            memory_type=record.memory_type,
-            title=record.title,
-            content=record.content,
-            retrieval_score=score,
-            matched_terms=[term for term in query_terms if term in record.content or term in record.keywords][:8],
-            reasons=reasons,
-        )
-        for score, record, reasons in scored[:limit]
-    ]
+    hits, index_status, retrieval_backend, query_terms = search_memory_records(
+        project_id,
+        records,
+        chapter_number=chapter_number,
+        query_text=query_text,
+        limit=limit,
+    )
     trace = MemoryRetrievalTrace(
         project_id=project_id,
         chapter_number=chapter_number,
         query_text=query_text,
         query_terms=query_terms[:20],
+        retrieval_backend=retrieval_backend,  # type: ignore[arg-type]
+        backend_status=index_status.backend_status,
         selected_record_ids=[item.record_id for item in hits],
         hits=hits,
     )

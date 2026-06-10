@@ -8,6 +8,7 @@ from app.schemas.domain import (
     BatchWriteResult,
     ChapterPlanCreate,
     Character,
+    CharacterRelationshipEdge,
     CharacterCreate,
     ContinuityReport,
     ContextPack,
@@ -19,7 +20,14 @@ from app.schemas.domain import (
     HealthResponse,
     HookRecord,
     HookStateChange,
+    LLMChapterPreflightRequest,
+    LLMChapterPreflightResult,
+    LLMDiagnosticResult,
+    LLMStatus,
+    LLMTestRunRequest,
+    LLMTestRunResult,
     LongTermMemoryRecord,
+    MemoryIndexStatus,
     MemoryRetrievalTrace,
     MetricsSummary,
     ReplanPatchRequest,
@@ -27,6 +35,8 @@ from app.schemas.domain import (
     Project,
     ProjectCreate,
     ProjectDetail,
+    QueueJob,
+    RunOpsSummary,
     RerunRequest,
     ReviewDecisionRequest,
     ReviewDecisionResult,
@@ -40,13 +50,23 @@ from app.schemas.domain import (
     StoryBible,
     StoryBibleCreate,
     TaskRun,
+    TimelineConstraint,
+    TimelineNode,
     RetconPatch,
     ReaderCouncilReport,
     WriteChapterRequest,
+    WorkerSnapshot,
     WritingRun,
 )
 from app.services.context_engine import build_context_pack
-from app.services.memory import rebuild_long_term_memory
+from app.services.llm_diagnostics import (
+    diagnose_llm,
+    get_llm_status,
+    run_llm_test,
+    run_project_chapter_preflight,
+)
+from app.services.memory import get_memory_index_status, rebuild_long_term_memory
+from app.services.ops import build_run_ops_summary
 from app.services.planning import build_chapter_plan, generate_book_plan
 from app.services.pipeline import (
     execute_batch_write,
@@ -82,18 +102,89 @@ def _require_project(project_id: str) -> Project:
 @router.get("/health", response_model=HealthResponse)
 def health_check() -> HealthResponse:
     settings = get_settings()
+    worker = scheduler_worker.snapshot()
     return HealthResponse(
         status="ok",
         app_name=settings.app_name,
         version=settings.app_version,
         use_mock_writer=settings.use_mock_writer,
-        worker_running=scheduler_worker.is_running(),
+        worker_running=worker.is_running,
+        worker_mode=worker.mode,
+        queue_backlog=worker.queue_backlog,
     )
 
 
-@router.get("/worker/status")
-def worker_status() -> dict[str, object]:
+@router.get("/worker/status", response_model=WorkerSnapshot)
+def worker_status() -> WorkerSnapshot:
     return scheduler_worker.snapshot()
+
+
+@router.post("/worker/start", response_model=WorkerSnapshot)
+def start_worker() -> WorkerSnapshot:
+    scheduler_worker.start(mode="embedded")
+    return scheduler_worker.snapshot()
+
+
+@router.post("/worker/stop", response_model=WorkerSnapshot)
+def stop_worker() -> WorkerSnapshot:
+    scheduler_worker.stop()
+    return scheduler_worker.snapshot()
+
+
+@router.post("/worker/run-once", response_model=WorkerSnapshot)
+def run_worker_once() -> WorkerSnapshot:
+    scheduler_worker.run_once()
+    return scheduler_worker.snapshot()
+
+
+@router.get("/llm/status", response_model=LLMStatus)
+def llm_status() -> LLMStatus:
+    return get_llm_status()
+
+
+@router.post("/llm/diagnose", response_model=LLMDiagnosticResult)
+def llm_diagnose() -> LLMDiagnosticResult:
+    return diagnose_llm()
+
+
+@router.get("/llm/diagnostics", response_model=list[LLMDiagnosticResult])
+def list_llm_diagnostics() -> list[LLMDiagnosticResult]:
+    return store.list_llm_diagnostics()
+
+
+@router.post("/llm/test-run", response_model=LLMTestRunResult)
+def llm_test_run(payload: LLMTestRunRequest) -> LLMTestRunResult:
+    try:
+        return run_llm_test(payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.get("/llm/test-runs", response_model=list[LLMTestRunResult])
+def list_llm_test_runs() -> list[LLMTestRunResult]:
+    return store.list_llm_test_runs()
+
+
+@router.get("/projects/{project_id}/llm/preflights", response_model=list[LLMChapterPreflightResult])
+def list_project_llm_preflights(project_id: str) -> list[LLMChapterPreflightResult]:
+    _require_project(project_id)
+    return store.list_llm_chapter_preflights(project_id)
+
+
+@router.post("/projects/{project_id}/llm/preflight", response_model=LLMChapterPreflightResult)
+def project_llm_preflight(
+    project_id: str,
+    payload: LLMChapterPreflightRequest,
+) -> LLMChapterPreflightResult:
+    _require_project(project_id)
+    try:
+        return run_project_chapter_preflight(project_id, payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @router.get("/projects", response_model=list[Project])
@@ -180,6 +271,24 @@ def create_event(project_id: str, payload: EventCreate) -> Event:
     return store.add_event(project_id, event)
 
 
+@router.get("/projects/{project_id}/relationship-edges", response_model=list[CharacterRelationshipEdge])
+def list_relationship_edges(project_id: str) -> list[CharacterRelationshipEdge]:
+    _require_project(project_id)
+    return store.list_relationship_edges(project_id)
+
+
+@router.get("/projects/{project_id}/timeline-nodes", response_model=list[TimelineNode])
+def list_project_timeline_nodes(project_id: str) -> list[TimelineNode]:
+    _require_project(project_id)
+    return store.list_timeline_nodes(project_id)
+
+
+@router.get("/projects/{project_id}/timeline-constraints", response_model=list[TimelineConstraint])
+def list_project_timeline_constraints(project_id: str) -> list[TimelineConstraint]:
+    _require_project(project_id)
+    return store.list_timeline_constraints(project_id)
+
+
 @router.post("/projects/{project_id}/plan/book")
 def create_book_plan(project_id: str) -> dict[str, object]:
     project = _require_project(project_id)
@@ -212,6 +321,19 @@ def list_project_memories(project_id: str) -> list[LongTermMemoryRecord]:
     return store.list_long_term_memories(project_id)
 
 
+@router.get("/projects/{project_id}/memory-index/status", response_model=MemoryIndexStatus)
+def get_project_memory_index_status(project_id: str) -> MemoryIndexStatus:
+    _require_project(project_id)
+    return get_memory_index_status(project_id)
+
+
+@router.post("/projects/{project_id}/memory-index/rebuild", response_model=MemoryIndexStatus)
+def rebuild_project_memory_index(project_id: str) -> MemoryIndexStatus:
+    _require_project(project_id)
+    rebuild_long_term_memory(project_id)
+    return get_memory_index_status(project_id)
+
+
 @router.post("/projects/{project_id}/memories/rebuild", response_model=list[LongTermMemoryRecord])
 def rebuild_project_memories(project_id: str) -> list[LongTermMemoryRecord]:
     _require_project(project_id)
@@ -222,6 +344,12 @@ def rebuild_project_memories(project_id: str) -> list[LongTermMemoryRecord]:
 def list_project_memory_traces(project_id: str) -> list[MemoryRetrievalTrace]:
     _require_project(project_id)
     return store.list_memory_retrieval_traces(project_id)
+
+
+@router.get("/projects/{project_id}/ops-summary", response_model=RunOpsSummary)
+def get_project_ops_summary(project_id: str) -> RunOpsSummary:
+    _require_project(project_id)
+    return build_run_ops_summary(project_id)
 
 
 @router.get("/projects/{project_id}/chapters")
@@ -236,6 +364,8 @@ def write_chapter(project_id: str, payload: WriteChapterRequest) -> dict[str, ob
 
     try:
         return execute_write(project, payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         failed_run = WritingRun(
             project_id=project_id,
@@ -251,7 +381,10 @@ def write_chapter(project_id: str, payload: WriteChapterRequest) -> dict[str, ob
 @router.post("/projects/{project_id}/write/batch", response_model=BatchWriteResult)
 def write_batch(project_id: str, payload: BatchWriteRequest) -> BatchWriteResult:
     project = _require_project(project_id)
-    result = execute_batch_write(project, payload)
+    try:
+        result = execute_batch_write(project, payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     if result.status == "failed":
         raise HTTPException(status_code=500, detail=result.message)
     return result
@@ -261,6 +394,12 @@ def write_batch(project_id: str, payload: BatchWriteRequest) -> BatchWriteResult
 def list_scheduler_tasks(project_id: str) -> list[SchedulerTask]:
     _require_project(project_id)
     return store.list_scheduler_tasks(project_id)
+
+
+@router.get("/projects/{project_id}/queue-jobs", response_model=list[QueueJob])
+def list_project_queue_jobs(project_id: str) -> list[QueueJob]:
+    _require_project(project_id)
+    return store.list_queue_jobs(project_id)
 
 
 @router.post("/projects/{project_id}/scheduler-tasks", response_model=SchedulerTask)
@@ -334,7 +473,10 @@ def rollback_project(project_id: str, payload: RollbackRequest) -> RollbackResul
 @router.post("/projects/{project_id}/rerun", response_model=BatchWriteResult)
 def rerun_project(project_id: str, payload: RerunRequest) -> BatchWriteResult:
     project = _require_project(project_id)
-    result = execute_rerun(project, payload)
+    try:
+        result = execute_rerun(project, payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     if result.status == "failed":
         raise HTTPException(status_code=500, detail=result.message)
     return result

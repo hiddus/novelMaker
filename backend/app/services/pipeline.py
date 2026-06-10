@@ -18,20 +18,85 @@ from app.schemas.domain import (
 from app.services.canon import apply_extracted_update_to_canon, extract_chapter_update
 from app.services.continuity import run_continuity_board
 from app.services.context_engine import build_context_pack
+from app.services.llm_diagnostics import ensure_writer_mode_available
 from app.services.metrics import build_chapter_metric
 from app.services.planning import build_replanned_chapter_plans
 from app.services.reader_council import run_reader_council
+from app.services.retcon import patch_rerun_window_end
 from app.services.reviewer import review_chapter
 from app.services.store import store
 from app.services.writing import create_chapter_draft, create_rewrite_draft
 
 
+def _chapter_projection_is_complete(project_id: str, chapter_id: str) -> bool:
+    snapshots = [item for item in store.list_snapshots(project_id) if item.chapter_id == chapter_id]
+    versions = [item for item in store.list_versions(project_id) if item.chapter_id == chapter_id]
+    timeline_nodes = [item for item in store.list_timeline_nodes(project_id) if item.chapter_id == chapter_id]
+    if not snapshots or not versions or not timeline_nodes:
+        return False
+    chapter_number = versions[0].chapter_number
+    snapshots_by_id = {item.id: item for item in snapshots}
+    extracted_updates = store.list_extracted_updates(project_id)
+    extracted_updates_by_id = {item.id: item for item in extracted_updates}
+    timeline_node_ids = {item.id for item in timeline_nodes}
+    event_ids = {item.id for item in store.list_events(project_id)}
+    state_ids = {item.id for item in store.list_character_states(project_id)}
+    relationship_edge_ids = {item.id for item in store.list_relationship_edges(project_id)}
+    hook_ids = {item.id for item in store.list_hook_records(project_id)}
+    chapter_constraints = {
+        item.description
+        for item in store.list_timeline_constraints(project_id)
+        if item.chapter_number == chapter_number
+    }
+    chapter_hook_changes = [
+        item
+        for item in store.list_hook_state_changes(project_id)
+        if item.chapter_id == chapter_id
+    ]
+
+    for version in versions:
+        snapshot = snapshots_by_id.get(version.snapshot_id)
+        extracted_update = extracted_updates_by_id.get(version.extracted_update_id)
+        if snapshot is None or extracted_update is None:
+            continue
+        if extracted_update.event_ids and any(item not in event_ids for item in extracted_update.event_ids):
+            continue
+        if extracted_update.character_state_ids and any(item not in state_ids for item in extracted_update.character_state_ids):
+            continue
+        if extracted_update.relationship_edge_ids and any(
+            item not in relationship_edge_ids for item in extracted_update.relationship_edge_ids
+        ):
+            continue
+        if extracted_update.timeline_node_ids and any(item not in timeline_node_ids for item in extracted_update.timeline_node_ids):
+            continue
+        if extracted_update.timeline_constraints and not all(
+            item in chapter_constraints for item in extracted_update.timeline_constraints
+        ):
+            continue
+        if snapshot.recent_event_ids and any(item not in event_ids for item in snapshot.recent_event_ids):
+            continue
+        if snapshot.relationship_edge_ids and any(item not in relationship_edge_ids for item in snapshot.relationship_edge_ids):
+            continue
+        if snapshot.timeline_node_ids and any(item not in timeline_node_ids for item in snapshot.timeline_node_ids):
+            continue
+        if snapshot.active_hook_ids and any(item not in hook_ids for item in snapshot.active_hook_ids):
+            continue
+        if extracted_update.hook_changes:
+            if not chapter_hook_changes:
+                continue
+            if any(item.hook_id not in hook_ids for item in chapter_hook_changes):
+                continue
+        return True
+    return False
+
+
 def execute_write(project: Project, payload: WriteChapterRequest) -> dict[str, object]:
+    ensure_writer_mode_available(payload.writer_mode)
     plans = store.list_chapter_plans(project.id)
     context_pack = build_context_pack(project.id, payload.chapter_number)
     run, chapter = create_chapter_draft(project, payload, plans, context_pack)
     store.save_run(project.id, run)
-    extracted_update, created_event, created_state = extract_chapter_update(
+    extracted_update, created_event, created_state, relationship_edges, timeline_node, timeline_constraints = extract_chapter_update(
         project.id,
         chapter,
         context_pack,
@@ -62,6 +127,9 @@ def execute_write(project: Project, payload: WriteChapterRequest) -> dict[str, o
             extracted_update,
             created_event,
             created_state,
+            relationship_edges,
+            timeline_node,
+            timeline_constraints,
         )
 
     metric = build_chapter_metric(
@@ -97,6 +165,8 @@ def execute_review_decision(
     chapter = store.get_chapter(project.id, review.chapter_id)
     if chapter is None:
         raise ValueError("章节草稿不存在")
+    if not chapter.is_current:
+        raise ValueError("该评审对应的是旧版本章节，请处理当前修订稿")
 
     if review.human_decision_status != "pending":
         raise ValueError("该评审已经处理过了")
@@ -116,10 +186,9 @@ def execute_review_decision(
     version = None
 
     if payload.decision == "approve":
-        has_version = any(item.chapter_id == chapter.id for item in store.list_versions(project.id))
-        if not has_version:
+        if not _chapter_projection_is_complete(project.id, chapter.id):
             context_pack = build_context_pack(project.id, chapter.chapter_number)
-            extracted_update, created_event, created_state = extract_chapter_update(
+            extracted_update, created_event, created_state, relationship_edges, timeline_node, timeline_constraints = extract_chapter_update(
                 project.id,
                 chapter,
                 context_pack,
@@ -131,6 +200,9 @@ def execute_review_decision(
                 extracted_update,
                 created_event,
                 created_state,
+                relationship_edges,
+                timeline_node,
+                timeline_constraints,
             )
 
         saved_chapter = store.save_chapter(project.id, chapter.model_copy(update={"status": "approved"}))
@@ -181,6 +253,7 @@ def execute_rewrite(
     review_id: str,
     payload: RewriteChapterRequest,
 ) -> RewriteChapterResult:
+    ensure_writer_mode_available(payload.writer_mode)
     review = store.get_review(project.id, review_id)
     if review is None:
         raise ValueError("评审记录不存在")
@@ -190,6 +263,8 @@ def execute_rewrite(
     source_chapter = store.get_chapter(project.id, review.chapter_id)
     if source_chapter is None:
         raise ValueError("待重写章节不存在")
+    if not source_chapter.is_current:
+        raise ValueError("该评审对应的是旧版本章节，不能继续重写")
     if source_chapter.status == "approved":
         raise ValueError("已通过章节不能直接进入自动重写")
 
@@ -221,7 +296,7 @@ def execute_rewrite(
         store.save_chapter(project.id, source_chapter.model_copy(update={"is_current": False}))
         saved_chapter = store.add_chapter(project.id, rewritten_chapter)
 
-        extracted_update, created_event, created_state = extract_chapter_update(
+        extracted_update, created_event, created_state, relationship_edges, timeline_node, timeline_constraints = extract_chapter_update(
             project.id,
             saved_chapter,
             context_pack,
@@ -252,6 +327,9 @@ def execute_rewrite(
                 extracted_update,
                 created_event,
                 created_state,
+                relationship_edges,
+                timeline_node,
+                timeline_constraints,
             )
 
         metric = build_chapter_metric(
@@ -339,6 +417,7 @@ def execute_patch_replan(
 
 
 def execute_batch_write(project: Project, payload: BatchWriteRequest) -> BatchWriteResult:
+    ensure_writer_mode_available(payload.writer_mode)
     task_run = TaskRun(
         project_id=project.id,
         task_type="batch_write",
@@ -407,6 +486,7 @@ def execute_batch_write(project: Project, payload: BatchWriteRequest) -> BatchWr
 
 
 def execute_rerun(project: Project, payload: RerunRequest) -> BatchWriteResult:
+    ensure_writer_mode_available(payload.writer_mode)
     task_run = TaskRun(
         project_id=project.id,
         task_type="rerun",
@@ -414,6 +494,70 @@ def execute_rerun(project: Project, payload: RerunRequest) -> BatchWriteResult:
         payload_summary=f"从第 {payload.from_chapter} 章重跑到第 {payload.end_chapter} 章",
     )
     store.save_task_run(project.id, task_run)
+    if payload.end_chapter < payload.from_chapter:
+        result = BatchWriteResult(
+            project_id=project.id,
+            start_chapter=payload.from_chapter,
+            end_chapter=payload.end_chapter,
+            completed_chapters=[],
+            failed_chapter=payload.from_chapter,
+            status="failed",
+            message="重跑终点不能早于起始章节",
+        )
+        task_run.status = "failed"
+        task_run.completed_at = datetime.now(UTC)
+        task_run.result_summary = result.message
+        store.save_task_run(project.id, task_run)
+        return result
+    patch = None
+    if payload.patch_id:
+        patch = next((item for item in store.list_retcon_patches(project.id) if item.id == payload.patch_id), None)
+        if patch is None:
+            result = BatchWriteResult(
+                project_id=project.id,
+                start_chapter=payload.from_chapter,
+                end_chapter=payload.end_chapter,
+                completed_chapters=[],
+                failed_chapter=payload.from_chapter,
+                status="failed",
+                message="补丁不存在",
+            )
+            task_run.status = "failed"
+            task_run.completed_at = datetime.now(UTC)
+            task_run.result_summary = result.message
+            store.save_task_run(project.id, task_run)
+            return result
+        if payload.from_chapter > patch.recommended_rerun_from:
+            result = BatchWriteResult(
+                project_id=project.id,
+                start_chapter=payload.from_chapter,
+                end_chapter=payload.end_chapter,
+                completed_chapters=[],
+                failed_chapter=payload.from_chapter,
+                status="failed",
+                message="重跑起点不能晚于补丁建议重跑起点",
+            )
+            task_run.status = "failed"
+            task_run.completed_at = datetime.now(UTC)
+            task_run.result_summary = result.message
+            store.save_task_run(project.id, task_run)
+            return result
+        if payload.end_chapter < patch_rerun_window_end(patch):
+            result = BatchWriteResult(
+                project_id=project.id,
+                start_chapter=payload.from_chapter,
+                end_chapter=payload.end_chapter,
+                completed_chapters=[],
+                failed_chapter=payload.from_chapter,
+                status="failed",
+                message="重跑终点不能早于补丁影响窗口末章",
+            )
+            task_run.status = "failed"
+            task_run.completed_at = datetime.now(UTC)
+            task_run.result_summary = result.message
+            store.save_task_run(project.id, task_run)
+            return result
+    cleared = store.truncate_project_from_chapter(project.id, payload.from_chapter)
 
     result = execute_batch_write(
         project,
@@ -427,15 +571,24 @@ def execute_rerun(project: Project, payload: RerunRequest) -> BatchWriteResult:
 
     task_run.status = "completed" if result.status == "completed" else "failed"
     task_run.completed_at = datetime.now(UTC)
-    task_run.result_summary = result.message
+    task_run.result_summary = (
+        f"{result.message} 已清理 ch{payload.from_chapter}+ 的旧状态："
+        f"chapters={cleared.get('chapters', 0)},"
+        f" events={cleared.get('events', 0)},"
+        f" states={cleared.get('character_states', 0)},"
+        f" rel={cleared.get('relationship_edges', 0)},"
+        f" timeline={cleared.get('timeline_nodes', 0)}."
+    )
     store.save_task_run(project.id, task_run)
 
-    if payload.patch_id:
-        patches = store.list_retcon_patches(project.id)
-        patch = next((item for item in patches if item.id == payload.patch_id), None)
-        if patch is not None and result.status == "completed":
+    if patch is not None and result.status == "completed":
             patch.status = "rerun_completed"
             store.save_retcon_patch(project.id, patch)
+            store.resolve_patch_timeline_constraints(
+                project.id,
+                patch.id,
+                resolved_in_chapter=result.end_chapter,
+            )
 
     return result
 

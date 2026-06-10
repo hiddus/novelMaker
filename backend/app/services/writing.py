@@ -32,6 +32,57 @@ def _provider_label() -> str:
     return "DeepSeek" if settings.llm_provider.lower() == "deepseek" else "OpenAI"
 
 
+def estimate_tokens(text: str) -> int:
+    return _estimate_tokens(text)
+
+
+def provider_label() -> str:
+    return _provider_label()
+
+
+def resolve_writer_mode(requested_mode: str) -> str:
+    settings = get_settings()
+    if requested_mode == "auto":
+        return "mock" if settings.use_mock_writer or not settings.openai_api_key else "openai"
+    return requested_mode
+
+
+def call_openai_compatible(messages: list[dict[str, str]], *, temperature: float = 0.9) -> str:
+    settings = get_settings()
+    if not settings.openai_api_key:
+        raise RuntimeError("OPENAI_API_KEY 未配置，无法使用 LLM writer")
+
+    request_body = {
+        "model": settings.openai_model,
+        "messages": messages,
+        "temperature": temperature,
+    }
+
+    request = Request(
+        urljoin(settings.openai_base_url.rstrip("/") + "/", "chat/completions"),
+        method="POST",
+        data=json.dumps(request_body).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {settings.openai_api_key}",
+            "Content-Type": "application/json",
+        },
+    )
+
+    last_error: Exception | None = None
+    for attempt in range(settings.openai_max_retries + 1):
+        try:
+            with urlopen(request, timeout=settings.openai_timeout_seconds) as response:
+                data = json.loads(response.read().decode("utf-8"))
+            return data["choices"][0]["message"]["content"].strip()
+        except (HTTPError, URLError) as exc:
+            last_error = exc
+            if attempt >= settings.openai_max_retries:
+                raise RuntimeError(f"{_provider_label()} 请求失败: {exc}") from exc
+            time.sleep(settings.openai_retry_backoff_seconds * (attempt + 1))
+
+    raise RuntimeError(f"{_provider_label()} 请求失败: {last_error}")
+
+
 def _resolve_plan(payload: WriteChapterRequest, plans: list[ChapterPlan]) -> ChapterPlan | None:
     if payload.plan_id is not None:
         return next((plan for plan in plans if plan.id == payload.plan_id), None)
@@ -126,6 +177,14 @@ def _openai_prompt(
     return _truncate(prompt, settings.writer_max_prompt_chars)
 
 
+def build_chapter_prompt(
+    project: Project,
+    payload: WriteChapterRequest,
+    context_pack: ContextPack,
+) -> str:
+    return _openai_prompt(project, payload, context_pack)
+
+
 def _rewrite_prompt(
     project: Project,
     chapter: ChapterDraft,
@@ -175,13 +234,8 @@ def _generate_with_openai_prompt(
     chapter_number: int,
     summary: str,
 ) -> tuple[ChapterDraft, int, int]:
-    settings = get_settings()
-    if not settings.openai_api_key:
-        raise RuntimeError("OPENAI_API_KEY 未配置，无法使用 LLM writer")
-
-    request_body = {
-        "model": settings.openai_model,
-        "messages": [
+    content = call_openai_compatible(
+        [
             {
                 "role": "system",
                 "content": "你是一个擅长中文长篇网文创作的写作 Agent。",
@@ -191,34 +245,8 @@ def _generate_with_openai_prompt(
                 "content": prompt,
             },
         ],
-        "temperature": 0.9,
-    }
-
-    request = Request(
-        urljoin(settings.openai_base_url.rstrip("/") + "/", "chat/completions"),
-        method="POST",
-        data=json.dumps(request_body).encode("utf-8"),
-        headers={
-            "Authorization": f"Bearer {settings.openai_api_key}",
-            "Content-Type": "application/json",
-        },
+        temperature=0.9,
     )
-
-    last_error: Exception | None = None
-    for attempt in range(settings.openai_max_retries + 1):
-        try:
-            with urlopen(request, timeout=settings.openai_timeout_seconds) as response:
-                data = json.loads(response.read().decode("utf-8"))
-            break
-        except (HTTPError, URLError) as exc:
-            last_error = exc
-            if attempt >= settings.openai_max_retries:
-                raise RuntimeError(f"{_provider_label()} 请求失败: {exc}") from exc
-            time.sleep(settings.openai_retry_backoff_seconds * (attempt + 1))
-    else:
-        raise RuntimeError(f"{_provider_label()} 请求失败: {last_error}")
-
-    content = data["choices"][0]["message"]["content"].strip()
     lines = [line.strip() for line in content.splitlines() if line.strip()]
     title = lines[0] if lines else f"第{chapter_number}章"
     summary = (
@@ -260,10 +288,7 @@ def create_chapter_draft(
     matched_plan = _resolve_plan(payload, plans)
     settings = get_settings()
     requested_mode = payload.writer_mode
-    if requested_mode == "auto":
-        writer_mode = "mock" if settings.use_mock_writer or not settings.openai_api_key else "openai"
-    else:
-        writer_mode = requested_mode
+    writer_mode = resolve_writer_mode(requested_mode)
 
     run = WritingRun(
         project_id=project.id,
@@ -325,10 +350,7 @@ def create_rewrite_draft(
 ) -> tuple[WritingRun, ChapterDraft]:
     settings = get_settings()
     requested_mode = payload.writer_mode
-    if requested_mode == "auto":
-        writer_mode = "mock" if settings.use_mock_writer or not settings.openai_api_key else "openai"
-    else:
-        writer_mode = requested_mode
+    writer_mode = resolve_writer_mode(requested_mode)
 
     run = WritingRun(
         project_id=project.id,

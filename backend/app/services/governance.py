@@ -13,6 +13,8 @@ from app.schemas.domain import (
     ReviewReport,
     SchedulerTask,
 )
+from app.services.state_graph_diagnostics import build_state_graph_diagnostics
+from app.services.state_graph_repair import attach_state_graph_repair_suggestions, build_state_graph_recovery_plan
 from app.services.store import store
 
 T = TypeVar("T")
@@ -63,6 +65,60 @@ def _find_state_anomalies(states: list[CharacterState], keywords: list[str]) -> 
     return findings
 
 
+def _active_patch_alerts(project_id: str, *, exclude_patch_id: str | None = None) -> list[str]:
+    patches = [
+        item
+        for item in store.list_retcon_patches(project_id)
+        if item.status in {"open", "replanned"} and item.id != exclude_patch_id
+    ]
+    return [
+        f"{item.id} / {item.status} / rerun-from {item.recommended_rerun_from} / ch{item.target_chapter_number}"
+        for item in patches[:5]
+    ]
+
+
+def _continuing_timeline_alerts(project_id: str) -> list[str]:
+    constraints = [
+        item
+        for item in store.list_timeline_constraints(project_id)
+        if item.is_current
+        and item.previous_constraint_id
+        and item.constraint_type != "patch"
+        and item.status in {"warning", "violated"}
+    ]
+    return [
+        f"ch{item.chapter_number} / {item.constraint_type} / {item.status} / from {item.previous_constraint_id} / {item.description}"
+        for item in constraints[:6]
+    ]
+
+
+def _critical_state_graph_alerts(project_id: str) -> list[str]:
+    diagnostics = [
+        item
+        for item in build_state_graph_diagnostics(project_id)
+        if item.severity == "critical"
+    ]
+    return [
+        f"ch{item.chapter_number or 'n/a'} / {item.category} / {item.entity_type or 'unknown'} / {item.summary}"
+        for item in diagnostics[:6]
+    ]
+
+
+def _state_graph_recovery_guidance(project_id: str) -> list[str]:
+    diagnostics = build_state_graph_diagnostics(project_id)
+    if not diagnostics:
+        return []
+    plan = build_state_graph_recovery_plan(
+        attach_state_graph_repair_suggestions(project_id, diagnostics)
+    )
+    if plan is None or not plan.can_create_scheduler_task:
+        return []
+    return [
+        f"建议 recovery 窗口：第 {plan.start_chapter or 'n/a'} 章 -> 第 {plan.end_chapter or 'n/a'} 章",
+        f"重点类别：{' / '.join(plan.focus_categories) or 'n/a'}",
+    ]
+
+
 def load_governance_policy(project_id: str) -> GovernancePolicy:
     return store.get_governance_policy(project_id)
 
@@ -70,9 +126,84 @@ def load_governance_policy(project_id: str) -> GovernancePolicy:
 def evaluate_governance_before_step(project_id: str, task: SchedulerTask) -> tuple[GovernancePolicy, GovernanceDecision]:
     policy = load_governance_policy(project_id)
     summary = store.build_metrics_summary(project_id)
+    pending_reviews = [
+        item
+        for item in store.list_current_reviews(project_id)
+        if item.status == "review_required" and item.human_decision_status == "pending"
+    ]
+    active_patch_alerts = _active_patch_alerts(
+        project_id,
+        exclude_patch_id=task.patch_id if task.mode == "recovery" else None,
+    )
+    continuing_timeline_alerts = _continuing_timeline_alerts(project_id)
+    critical_state_graph_alerts = _critical_state_graph_alerts(project_id)
+    state_graph_recovery_guidance = _state_graph_recovery_guidance(project_id)
 
     if not policy.enabled:
         return policy, GovernanceDecision(action="continue", status="clear", signal="manual", reason="治理策略未启用")
+
+    if active_patch_alerts and not (task.mode == "recovery" and task.patch_id):
+        return policy, GovernanceDecision(
+            action="pause",
+            status="blocked",
+            signal="state",
+            reason=(
+                "存在未消化的 Retcon Patch，任务已暂停"
+                if task.mode == "recovery"
+                else "存在未消化的 Retcon Patch，写作任务已暂停"
+            ),
+            details=[
+                (
+                    "请先完成补丁重规划与绑定 patch 的 recovery，再继续推进任务。"
+                    if task.mode == "recovery"
+                    else "请先完成补丁重规划与 rerun，再继续推进新章节。"
+                ),
+                *active_patch_alerts,
+            ],
+        )
+
+    if critical_state_graph_alerts and task.mode != "recovery":
+        return policy, GovernanceDecision(
+            action="pause",
+            status="blocked",
+            signal="state",
+            reason="存在关键状态图谱断链，任务已暂停",
+            details=[
+                f"当前关键状态图谱问题 {len(critical_state_graph_alerts)} 条",
+                "请先修复 current revision 的 projection / snapshot / version / graph 引用断链。",
+                *state_graph_recovery_guidance,
+                *critical_state_graph_alerts[:5],
+            ],
+        )
+
+    if pending_reviews:
+        return policy, GovernanceDecision(
+            action="pause",
+            status="blocked",
+            signal="review",
+            reason="存在待人工处理的 review_required 章节，任务已暂停",
+            details=[
+                f"ch{item.chapter_number} / review={item.id} / {item.decision_reason or item.status}"
+                for item in pending_reviews[:5]
+            ],
+        )
+
+    if (
+        policy.pause_on_continuing_timeline_risk
+        and task.mode != "recovery"
+        and len(continuing_timeline_alerts) >= policy.max_continuing_timeline_risks
+    ):
+        return policy, GovernanceDecision(
+            action="pause",
+            status="blocked",
+            signal="continuity",
+            reason="存在持续未闭合的时间线风险链，任务已暂停",
+            details=[
+                f"当前延续型时间线风险 {len(continuing_timeline_alerts)} 条",
+                f"治理阈值 {policy.max_continuing_timeline_risks} 条",
+                *continuing_timeline_alerts[:5],
+            ],
+        )
 
     if summary.total_estimated_cost_usd >= policy.max_total_estimated_cost_usd:
         return policy, GovernanceDecision(
@@ -135,9 +266,9 @@ def evaluate_governance_after_chapter(
         )
 
     metrics = store.list_chapter_metrics(project_id)
-    reviews = store.list_reviews(project_id)
-    continuity_reports = store.list_continuity_reports(project_id)
-    reader_reports = store.list_reader_council_reports(project_id)
+    reviews = store.list_current_reviews(project_id)
+    continuity_reports = store.list_current_continuity_reports(project_id)
+    reader_reports = store.list_current_reader_council_reports(project_id)
     states = store.list_character_states(project_id)
 
     metric = _latest_item_by_chapter(metrics, chapter_number)
@@ -246,6 +377,44 @@ def evaluate_governance_after_chapter(
     if metric is not None:
         details.append(
             f"累计成本 {summary.total_estimated_cost_usd} USD / 预算 {policy.max_total_estimated_cost_usd} USD"
+        )
+    continuing_timeline_alerts = _continuing_timeline_alerts(project_id)
+    critical_state_graph_alerts = _critical_state_graph_alerts(project_id)
+    state_graph_recovery_guidance = _state_graph_recovery_guidance(project_id)
+    if critical_state_graph_alerts and (
+        task.mode != "recovery" or chapter_number >= task.end_chapter
+    ):
+        return policy, GovernanceDecision(
+            action="pause",
+            status="blocked",
+            signal="state",
+            reason=(
+                f"第 {chapter_number} 章后检测到关键状态图谱断链"
+                if task.mode != "recovery"
+                else f"恢复任务在第 {chapter_number} 章收尾时仍存在关键状态图谱断链"
+            ),
+            details=[
+                f"当前关键状态图谱问题 {len(critical_state_graph_alerts)} 条",
+                *state_graph_recovery_guidance,
+                *critical_state_graph_alerts[:5],
+            ],
+            chapter_number=chapter_number,
+        )
+    if (
+        policy.pause_on_continuing_timeline_risk
+        and len(continuing_timeline_alerts) >= policy.max_continuing_timeline_risks
+    ):
+        return policy, GovernanceDecision(
+            action="pause",
+            status="blocked",
+            signal="continuity",
+            reason=f"第 {chapter_number} 章后仍存在未闭合的时间线风险链",
+            details=[
+                f"当前延续型时间线风险 {len(continuing_timeline_alerts)} 条",
+                f"治理阈值 {policy.max_continuing_timeline_risks} 条",
+                *continuing_timeline_alerts[:5],
+            ],
+            chapter_number=chapter_number,
         )
     return policy, GovernanceDecision(
         action="continue",

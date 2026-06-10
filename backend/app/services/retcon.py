@@ -65,3 +65,10 @@ def summarize_invalidated_plans(plans: list[ChapterPlan], target_chapter_number:
             if plan.hook:
                 hook_candidates.append(plan.hook)
     return invalidated_plan_ids, hook_candidates
+
+
+def patch_rerun_window_end(patch: RetconPatch) -> int:
+    chapters = patch.affected_chapter_numbers or patch.removed_chapter_numbers
+    if chapters:
+        return max(chapters)
+    return patch.recommended_rerun_from

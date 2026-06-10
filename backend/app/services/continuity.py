@@ -46,6 +46,79 @@ def _active_character_names(characters: list[Character]) -> list[str]:
     return [item.name for item in characters if item.status == "active"]
 
 
+def _relationship_conflict_issue(
+    context_pack: ContextPack,
+    extracted_update: ExtractedUpdate,
+) -> list[ContinuityIssue]:
+    issues: list[ContinuityIssue] = []
+    existing_pairs = {
+        (item.source_character_id, item.target_character_id): item.relation_type
+        for item in context_pack.relationship_edges
+        if item.is_current
+    }
+    for item in context_pack.relationship_edges:
+        if not item.is_current:
+            continue
+        existing_pairs[(item.target_character_id, item.source_character_id)] = item.relation_type
+    for signal in extracted_update.relationship_signals:
+        if not existing_pairs:
+            break
+        if signal in {"盟友", "结盟"} and "enemy" in existing_pairs.values():
+            _push_issue(
+                issues,
+                "character",
+                "medium",
+                "关系链突变",
+                "近期关系图谱里存在敌对关系，但本章突然切成盟友，需要补充转折过程。",
+                list(dict.fromkeys(extracted_update.relationship_signals))[:4],
+                "补充和解、交易或共同危机带来的关系转折。",
+            )
+            break
+        if signal == "背叛" and any(value in {"ally", "family", "lover"} for value in existing_pairs.values()):
+            _push_issue(
+                issues,
+                "character",
+                "medium",
+                "背叛缺少铺垫",
+                "关系图谱显示双方近期偏向正向关系，但本章出现背叛信号。",
+                list(dict.fromkeys(extracted_update.relationship_signals))[:4],
+                "补充猜疑、利益冲突或前置伏笔，让背叛更可解释。",
+            )
+            break
+    return issues
+
+
+def _timeline_constraint_issue(context_pack: ContextPack) -> list[ContinuityIssue]:
+    issues: list[ContinuityIssue] = []
+    for constraint in context_pack.active_timeline_constraints:
+        chain_detail = (
+            f"该风险延续自 {constraint.previous_constraint_id}，说明前序章节已出现同类问题但尚未闭合。"
+            if constraint.previous_constraint_id
+            else "该风险为当前章节首次暴露的时间线问题。"
+        )
+        if constraint.status == "violated":
+            _push_issue(
+                issues,
+                "timeline",
+                "high",
+                "延续性时间线约束已冲突" if constraint.previous_constraint_id else "新增时间线约束已冲突",
+                f"{constraint.description} {chain_detail}",
+                constraint.evidence[:4],
+                constraint.recommendation or "回退时间线或补充过渡。",
+            )
+        elif constraint.status == "warning":
+            _push_issue(
+                issues,
+                "timeline",
+                "medium",
+                "延续性时间线约束待消化" if constraint.previous_constraint_id else "新增时间线约束待消化",
+                f"{constraint.description} {chain_detail}",
+                constraint.evidence[:4],
+                constraint.recommendation or "继续写作前先消化当前时间线风险。",
+            )
+    return issues
+
+
 def _power_jump_issue(
     chapter: ChapterDraft,
     characters: list[Character],
@@ -149,6 +222,8 @@ def run_continuity_board(
             [],
             "增加协作、冲突、背叛、试探等互动结果。",
         )
+    else:
+        issues.extend(_relationship_conflict_issue(context_pack, extracted_update))
 
     if context_pack.open_retcon_patches:
         open_patch_ids = [item.id for item in context_pack.open_retcon_patches[:4]]
@@ -172,6 +247,7 @@ def run_continuity_board(
             [],
             "补充事件结果、阶段节点或时间流逝的明确信号。",
         )
+    issues.extend(_timeline_constraint_issue(context_pack))
 
     previous_location = next(
         (item.location for item in context_pack.recent_character_states if item.location),

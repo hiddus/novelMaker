@@ -59,6 +59,16 @@ def _score_character(summary: str, keywords: list[str], role: str) -> float:
     return role_bonus + _overlap_score(summary, keywords) * 2.0
 
 
+def _score_relation(chapter_number: int, summary: str, item_chapter: int, keywords: list[str]) -> float:
+    recency = max(0.0, 6 - abs(chapter_number - item_chapter))
+    return recency + _overlap_score(summary, keywords) * 2.1
+
+
+def _score_timeline(chapter_number: int, summary: str, item_chapter: int, keywords: list[str]) -> float:
+    recency = max(0.0, 7 - abs(chapter_number - item_chapter))
+    return recency + _overlap_score(summary, keywords) * 1.9
+
+
 def _dynamic_token_budget(
     total_budget_tokens: int,
     output_reserve_tokens: int,
@@ -90,6 +100,19 @@ def _dynamic_token_budget(
     }
 
 
+def _timeline_constraint_chain_label(constraint) -> str:
+    if constraint.previous_constraint_id:
+        return f"continuing-from {constraint.previous_constraint_id}"
+    return "chain-root"
+
+
+def _timeline_constraint_summary(constraint) -> str:
+    return (
+        f"约束 / {constraint.constraint_type} / {constraint.status} / "
+        f"{_timeline_constraint_chain_label(constraint)} / {constraint.description}"
+    )
+
+
 def build_context_pack(project_id: str, chapter_number: int) -> ContextPack:
     project = store.get_project(project_id)
     if project is None:
@@ -99,6 +122,9 @@ def build_context_pack(project_id: str, chapter_number: int) -> ContextPack:
     story_bible = store.get_story_bible(project_id)
     characters = store.list_characters(project_id)
     events = store.list_events(project_id)
+    relationship_edges = store.list_relationship_edges(project_id)
+    timeline_nodes = store.list_timeline_nodes(project_id)
+    timeline_constraints = store.list_timeline_constraints(project_id)
     chapter_plans = store.list_chapter_plans(project_id)
     character_states = store.list_character_states(project_id)
     snapshots = store.list_snapshots(project_id)
@@ -109,7 +135,7 @@ def build_context_pack(project_id: str, chapter_number: int) -> ContextPack:
         None,
     )
 
-    open_retcon_patches = [item for item in retcon_patches if item.status == "open"]
+    open_retcon_patches = [item for item in retcon_patches if item.status in {"open", "replanned"}]
     open_hooks = [
         item
         for item in hook_records
@@ -222,6 +248,44 @@ def build_context_pack(project_id: str, chapter_number: int) -> ContextPack:
         reverse=True,
     )
     active_characters = [item for _, item in scored_characters[: settings.context_max_characters]]
+    scored_relations = sorted(
+        (
+            (
+                _score_relation(
+                    chapter_number,
+                    f"{item.source_character_id} {item.target_character_id} {item.relation_type} {item.evidence} {item.change_type}",
+                    item.chapter_number,
+                    query_keywords,
+                )
+                + (2.5 if item.is_current else 0.0),
+                item,
+            )
+            for item in relationship_edges
+            if item.chapter_number <= chapter_number
+        ),
+        key=lambda pair: (pair[0], pair[1].chapter_number),
+        reverse=True,
+    )
+    recent_relationship_edges = [item for _, item in scored_relations[:6]]
+    scored_timeline_nodes = sorted(
+        (
+            (
+                _score_timeline(
+                    chapter_number,
+                    f"{item.label} {item.location or ''} {item.time_marker} {item.note}",
+                    item.chapter_number,
+                    query_keywords,
+                ),
+                item,
+            )
+            for item in timeline_nodes
+            if item.chapter_number <= chapter_number
+        ),
+        key=lambda pair: (pair[0], pair[1].chapter_number),
+        reverse=True,
+    )
+    recent_timeline_nodes = [item for _, item in scored_timeline_nodes[:6]]
+    active_timeline_constraints = store.list_active_timeline_constraints(project_id, chapter_number)[-6:]
 
     hard_constraints = story_bible.world_rules + story_bible.forbidden_rules
     retrieval_priorities = [
@@ -229,6 +293,8 @@ def build_context_pack(project_id: str, chapter_number: int) -> ContextPack:
         "高相关历史事件优先",
         "高相关角色状态优先",
         "开放伏笔优先",
+        "角色关系图谱优先",
+        "时间线节点与约束优先",
         "开放补丁与回滚影响优先",
         "章节号邻近度作为次级排序",
     ]
@@ -305,6 +371,30 @@ def build_context_pack(project_id: str, chapter_number: int) -> ContextPack:
         ),
         _approx_chars_from_tokens(token_budget["memory_tokens"]),
     )
+    relationship_summary = _truncate(
+        _join_or_default(
+            [
+                f"第{item.chapter_number}章 / {item.source_character_id}->{item.target_character_id} / {item.relation_type} / {item.change_type} / current={item.is_current} / {item.evidence}"
+                for item in recent_relationship_edges
+            ],
+            "暂无近期角色关系边。",
+        ),
+        _approx_chars_from_tokens(max(220, token_budget["character_state_tokens"] // 2)),
+    )
+    timeline_summary = _truncate(
+        _join_or_default(
+            [
+                f"第{item.chapter_number}章 / {item.time_marker} / {item.label} / {item.location or '未知地点'}"
+                for item in recent_timeline_nodes
+            ]
+            + [
+                _timeline_constraint_summary(item)
+                for item in active_timeline_constraints[:4]
+            ],
+            "暂无时间线节点与约束。",
+        ),
+        _approx_chars_from_tokens(max(220, token_budget["snapshot_tokens"] // 2)),
+    )
     event_diagnostics = [
         f"第{item.chapter_number}章 / score={round(score, 1)} / {item.summary}"
         for score, item in scored_events[: settings.context_max_events]
@@ -333,17 +423,32 @@ def build_context_pack(project_id: str, chapter_number: int) -> ContextPack:
         f"第{item.chapter_number}章 / {item.source_type} / {item.memory_type} / score={item.retrieval_score} / terms={','.join(item.matched_terms[:4]) or '无'}"
         for item in memory_hits
     ]
+    relationship_diagnostics = [
+        f"第{item.chapter_number}章 / {item.source_character_id}->{item.target_character_id} / {item.relation_type} / {item.change_type} / current={item.is_current} / score={round(score, 1)}"
+        for score, item in scored_relations[:6]
+    ]
+    timeline_diagnostics = [
+        f"第{item.chapter_number}章 / {item.time_marker} / score={round(score, 1)} / {item.label}"
+        for score, item in scored_timeline_nodes[:6]
+    ] + [
+        f"constraint / 第{item.chapter_number}章 / {item.constraint_type} / "
+        f"{item.status} / {_timeline_constraint_chain_label(item)} / {item.description}"
+        for item in active_timeline_constraints[:4]
+    ]
     selection_reasoning = [
         f"query_terms={', '.join(query_keywords[:12]) or '无'}",
-        f"selected_events={len(recent_events)} / selected_states={len(recent_character_states)} / selected_snapshots={len(recent_snapshots)} / selected_hooks={len(open_hooks)} / selected_patches={len(open_retcon_patches)}",
+        f"selected_events={len(recent_events)} / selected_states={len(recent_character_states)} / selected_snapshots={len(recent_snapshots)} / selected_relations={len(recent_relationship_edges)} / selected_timeline={len(recent_timeline_nodes)} / selected_hooks={len(open_hooks)} / selected_patches={len(open_retcon_patches)}",
         f"snapshot_summary={snapshot_summary}",
         f"memory_trace={memory_trace.id}",
+        f"memory_backend={memory_trace.retrieval_backend} / status={memory_trace.backend_status}",
     ]
     context_summary = (
         f"第 {chapter_number} 章上下文包："
         f"从 {len(events)} 条事件中选出 {len(recent_events)} 条，"
         f"从 {len(character_states)} 条状态中选出 {len(recent_character_states)} 条，"
         f"从 {len(snapshots)} 个快照中选出 {len(recent_snapshots)} 个，"
+        f"关系边 {len(recent_relationship_edges)} 条，"
+        f"时间线节点 {len(recent_timeline_nodes)} 个，"
         f"长期记忆命中 {len(memory_hits)} 条，"
         f"开放伏笔 {len(open_hooks)} 条，"
         f"开放补丁 {len(open_retcon_patches)} 个。"
@@ -356,6 +461,9 @@ def build_context_pack(project_id: str, chapter_number: int) -> ContextPack:
         recent_events=recent_events,
         active_characters=active_characters,
         long_term_memories=memory_hits,
+        relationship_edges=recent_relationship_edges,
+        timeline_nodes=recent_timeline_nodes,
+        active_timeline_constraints=active_timeline_constraints,
         open_hooks=open_hooks,
         recent_character_states=recent_character_states,
         recent_snapshots=recent_snapshots,
@@ -369,15 +477,20 @@ def build_context_pack(project_id: str, chapter_number: int) -> ContextPack:
         character_state_summary=character_state_summary,
         patch_summary=patch_summary,
         memory_summary=memory_summary,
+        relationship_summary=relationship_summary,
+        timeline_summary=timeline_summary,
         token_budget=token_budget,
         retrieval_diagnostics={
             "events": event_diagnostics,
             "character_states": state_diagnostics,
             "snapshots": snapshot_diagnostics,
+            "relationships": relationship_diagnostics,
+            "timeline": timeline_diagnostics,
             "long_term_memory": memory_diagnostics,
             "open_hooks": hook_diagnostics,
             "patches": patch_diagnostics,
             "characters": character_diagnostics,
         },
-        selection_reasoning=selection_reasoning + [f"hook_summary={hook_summary}", f"memory_summary={memory_summary}"],
+        selection_reasoning=selection_reasoning
+        + [f"hook_summary={hook_summary}", f"memory_summary={memory_summary}", f"relationship_summary={relationship_summary}"],
     )

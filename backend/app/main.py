@@ -26,7 +26,8 @@ app.include_router(router)
 
 @app.on_event("startup")
 def startup_event() -> None:
-    scheduler_worker.start()
+    if settings.embedded_worker_enabled:
+        scheduler_worker.start(mode="embedded")
 
 
 @app.on_event("shutdown")

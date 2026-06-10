@@ -16,23 +16,53 @@ from app.services.governance import (
     evaluate_governance_before_step,
     load_governance_policy,
 )
+from app.services.llm_diagnostics import build_llm_block_decision, ensure_writer_mode_available, get_llm_status
 from app.services.pipeline import execute_patch_replan, execute_write
+from app.services.retcon import patch_rerun_window_end
 from app.services.store import store
 
 
 def create_scheduler_task(project: Project, payload: SchedulerTaskCreate) -> SchedulerTask:
+    ensure_writer_mode_available(payload.writer_mode)
     policy = load_governance_policy(project.id)
-    stage = "replanning" if payload.mode == "recovery" else "writing"
+    stage = "rerunning" if payload.mode == "recovery" and not payload.patch_id else "replanning" if payload.mode == "recovery" else "writing"
     next_chapter = payload.start_chapter
-    if payload.mode == "recovery" and not payload.patch_id:
-        raise ValueError("恢复任务必须提供 patch_id")
+    active_patches = [
+        item
+        for item in store.list_retcon_patches(project.id)
+        if item.status in {"open", "replanned"}
+    ]
+    if payload.mode == "recovery" and not payload.patch_id and active_patches:
+        raise ValueError("存在未消化的 Retcon Patch，请优先创建绑定 patch 的 recovery 任务")
     if payload.mode == "recovery" and payload.patch_id:
         patch = next((item for item in store.list_retcon_patches(project.id) if item.id == payload.patch_id), None)
         if patch is None:
             raise ValueError("patch not found")
-        next_chapter = patch.recommended_rerun_from
-        if payload.end_chapter < next_chapter:
-            raise ValueError("恢复任务的结束章节不能早于补丁建议重跑起点")
+        rerun_from = patch.recommended_rerun_from
+        rerun_end = patch_rerun_window_end(patch)
+        next_chapter = rerun_from
+        if payload.start_chapter > rerun_from:
+            raise ValueError("恢复任务起点不能晚于补丁建议重跑起点")
+        if payload.end_chapter < rerun_end:
+            raise ValueError("恢复任务的结束章节不能早于补丁影响窗口末章")
+    llm_status = get_llm_status()
+    if payload.writer_mode == "auto" and llm_status.writer_route == "mock":
+        stage_message = (
+            "等待执行章节生成（当前 auto 路由会走 mock writer）"
+            if payload.mode != "recovery"
+            else (
+                "等待执行恢复重规划（当前 auto 路由会走 mock writer）"
+                if payload.patch_id
+                else "等待执行恢复重跑（当前 auto 路由会走 mock writer）"
+            )
+        )
+    else:
+        if payload.mode != "recovery":
+            stage_message = "等待执行章节生成"
+        elif payload.patch_id:
+            stage_message = "等待执行恢复重规划"
+        else:
+            stage_message = "等待执行恢复重跑"
     task = SchedulerTask(
         project_id=project.id,
         start_chapter=payload.start_chapter,
@@ -46,7 +76,7 @@ def create_scheduler_task(project: Project, payload: SchedulerTaskCreate) -> Sch
         patch_id=payload.patch_id,
         governance_policy_id=policy.id,
         governance_cost_limit_usd=policy.max_total_estimated_cost_usd,
-        stage_message="等待执行恢复重规划" if payload.mode == "recovery" else "等待执行章节生成",
+        stage_message=stage_message,
     )
     return store.save_scheduler_task(project.id, task)
 
@@ -84,6 +114,29 @@ def _set_task_state(
         }
     )
     return store.save_scheduler_task(project_id, updated)
+
+
+def _enqueue_scheduler_task(project_id: str, task: SchedulerTask, message: str) -> SchedulerTask:
+    updated = store.save_scheduler_task(
+        project_id,
+        task.model_copy(
+            update={
+                "status": "queued",
+                "stage_message": message,
+                "updated_at": datetime.now(UTC),
+            }
+        ),
+    )
+    job = store.enqueue_scheduler_task_job(project_id, updated, message)
+    return store.save_scheduler_task(
+        project_id,
+        updated.model_copy(
+            update={
+                "active_queue_job_id": job.id,
+                "updated_at": datetime.now(UTC),
+            }
+        ),
+    )
 
 
 def _apply_governance_decision(
@@ -131,16 +184,17 @@ def _apply_governance_decision(
 
 
 def _process_recovery_stage(project: Project, task: SchedulerTask) -> SchedulerTask:
-    if not task.patch_id:
-        raise ValueError("恢复任务缺少 patch_id")
-
-    patch = next((item for item in store.list_retcon_patches(project.id) if item.id == task.patch_id), None)
-    if patch is None:
-        raise ValueError("恢复补丁不存在")
+    patch = None
+    if task.patch_id:
+        patch = next((item for item in store.list_retcon_patches(project.id) if item.id == task.patch_id), None)
+        if patch is None:
+            raise ValueError("恢复补丁不存在")
 
     if task.stage == "replanning":
+        if patch is None:
+            raise ValueError("恢复重规划阶段缺少 patch_id")
         result = execute_patch_replan(project, task.patch_id, ReplanPatchRequest(tone=task.tone))
-        next_chapter = max(task.start_chapter, result.patch.recommended_rerun_from)
+        next_chapter = result.patch.recommended_rerun_from
         stage_message = f"补丁 {task.patch_id} 已重规划，准备从第 {next_chapter} 章重跑"
         task = task.model_copy(
             update={
@@ -199,6 +253,19 @@ def _process_recovery_stage(project: Project, task: SchedulerTask) -> SchedulerT
         return _apply_governance_decision(project, progress_task, decision)
 
     is_done = next_chapter > task.end_chapter
+    if patch is not None and is_done and task.end_chapter < patch_rerun_window_end(patch):
+        return store.save_scheduler_task(
+            project.id,
+            progress_task.model_copy(
+                update={
+                    "status": "failed",
+                    "stage": "governance_blocked",
+                    "stage_message": "恢复任务未覆盖补丁影响窗口，不能关闭当前 Retcon Patch",
+                    "last_error": "恢复任务未覆盖补丁影响窗口，不能关闭当前 Retcon Patch",
+                    "updated_at": datetime.now(UTC),
+                }
+            ),
+        )
     updated = progress_task.model_copy(
         update={
             "status": "completed" if is_done else "running",
@@ -209,9 +276,14 @@ def _process_recovery_stage(project: Project, task: SchedulerTask) -> SchedulerT
         }
     )
     store.save_scheduler_task(project.id, updated)
-    if is_done:
+    if is_done and patch is not None:
         result_patch = patch.model_copy(update={"status": "rerun_completed"})
         store.save_retcon_patch(project.id, result_patch)
+        store.resolve_patch_timeline_constraints(
+            project.id,
+            patch.id,
+            resolved_in_chapter=task.end_chapter,
+        )
     _save_task_run(project.id, "rerun", f"恢复任务执行第 {completed[-1]} 章", updated.stage_message, "completed")
     return updated
 
@@ -294,6 +366,9 @@ def process_scheduler_step(project: Project, task_id: str) -> SchedulerTask:
 
     _, decision = evaluate_governance_before_step(project.id, task)
     task = _set_task_state(project.id, task, status="running")
+    llm_decision = build_llm_block_decision(task.writer_mode)
+    if llm_decision is not None:
+        return _apply_governance_decision(project, task, llm_decision)
     if decision.action != "continue":
         return _apply_governance_decision(project, task, decision)
     if decision.status != "clear":
@@ -345,14 +420,39 @@ def run_scheduler_to_completion(project: Project, task_id: str) -> BatchWriteRes
             message=f"调度任务状态：{task.status}",
         )
 
-    if task.status == "paused":
+    if task.status == "queued":
+        return BatchWriteResult(
+            project_id=project.id,
+            start_chapter=task.start_chapter,
+            end_chapter=task.end_chapter,
+            completed_chapters=task.completed_chapters,
+            failed_chapter=None,
+            status="running",
+            message=f"调度任务已在队列中等待执行，当前 stage={task.stage}",
+        )
+
+    if task.status == "running":
+        if task.active_queue_job_id:
+            return BatchWriteResult(
+                project_id=project.id,
+                start_chapter=task.start_chapter,
+                end_chapter=task.end_chapter,
+                completed_chapters=task.completed_chapters,
+                failed_chapter=None,
+                status="running",
+                message=f"调度任务正在由 worker 执行，当前 stage={task.stage}",
+            )
+        task = _enqueue_scheduler_task(project.id, task, "任务继续执行，已重新入队")
+    elif task.status == "paused":
         if task.stage == "governance_blocked":
             stage = "rerunning" if task.mode == "recovery" else "writing"
         else:
             stage = "rerunning" if task.mode == "recovery" and task.stage != "replanning" else task.stage
-        task = _set_task_state(project.id, task, status="running", stage=stage, stage_message="任务已恢复执行", last_error="")
+        task = _set_task_state(project.id, task, status="queued", stage=stage, stage_message="任务已恢复并进入队列", last_error="")
+        task = _enqueue_scheduler_task(project.id, task, "任务已恢复并进入队列")
     elif task.status == "pending":
-        task = _set_task_state(project.id, task, status="running", stage_message="任务已进入后台执行", last_error="")
+        task = _set_task_state(project.id, task, status="queued", stage_message="任务已进入执行队列", last_error="")
+        task = _enqueue_scheduler_task(project.id, task, "任务已进入执行队列")
 
     return BatchWriteResult(
         project_id=project.id,
@@ -361,7 +461,7 @@ def run_scheduler_to_completion(project: Project, task_id: str) -> BatchWriteRes
         completed_chapters=task.completed_chapters,
         failed_chapter=None,
         status="running",
-        message=f"调度任务已进入后台执行，当前状态：{task.status} / stage={task.stage}",
+        message=f"调度任务已入队，当前状态：{task.status} / stage={task.stage}",
     )
 
 
@@ -389,13 +489,14 @@ def resume_scheduler_task(project: Project, task_id: str) -> SchedulerTask:
         next_stage = "rerunning" if task.mode == "recovery" else "writing"
     else:
         next_stage = "rerunning" if task.mode == "recovery" and task.stage == "awaiting_review" else task.stage
-    updated = _set_task_state(project.id, task, status="running", stage=next_stage, stage_message="任务已恢复执行", last_error="")
-    return _apply_governance_decision(
+    updated = _set_task_state(project.id, task, status="queued", stage=next_stage, stage_message="任务已恢复并进入队列", last_error="")
+    updated = _apply_governance_decision(
         project,
         updated,
         GovernanceDecision(action="continue", status="clear", signal="manual", reason="任务已人工恢复"),
         default_stage=next_stage,
     )
+    return _enqueue_scheduler_task(project.id, updated, "任务已人工恢复并重新入队")
 
 
 def retry_scheduler_task(project: Project, task_id: str) -> SchedulerTask:
@@ -409,19 +510,20 @@ def retry_scheduler_task(project: Project, task_id: str) -> SchedulerTask:
         project.id,
         task.model_copy(
             update={
-                "status": "running",
+                "status": "queued",
                 "stage": next_stage,
                 "retry_count": 0,
                 "consecutive_failures": 0,
                 "last_error": "",
-                "stage_message": "失败后重试任务",
+                "stage_message": "失败后重试任务，已重新入队",
                 "updated_at": datetime.now(UTC),
             }
         ),
     )
-    return _apply_governance_decision(
+    updated = _apply_governance_decision(
         project,
         updated,
         GovernanceDecision(action="continue", status="clear", signal="manual", reason="任务已人工重试"),
         default_stage=next_stage,
     )
+    return _enqueue_scheduler_task(project.id, updated, "失败后重试任务，已重新入队")
