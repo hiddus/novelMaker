@@ -173,6 +173,54 @@ class ChapterPlanCreate(BaseModel):
     conflict: str
     hook: str
     pov_character_id: str | None = None
+    # 增强字段
+    爽点类型: str = "升级爽"
+    爽点描述: str = ""
+    爽点强度: int = 7
+    爽点位置: str = "中后段"
+    节奏类型: str = "快节奏"
+    转折点数量: int = 3
+    节奏描述: str = ""
+    钩子类型: str = "悬念钩"
+    钩子描述: str = ""
+    钩子强度: int = 7
+    场景数量: int = 3
+    场景列表: list[str] = Field(default_factory=list)
+    情绪起点: str = "平稳"
+    情绪终点: str = "期待"
+    情绪转折点: int = 2
+    质量检查点: list[str] = Field(default_factory=list)
+
+
+class ChapterPlanEnhancedSpec(BaseModel):
+    """章节规划增强规范"""
+    # 爽点设计
+    爽点类型: str = "升级爽"  # 爽点类型：升级爽、打脸爽、逆袭爽、收获爽、认可爽
+    爽点描述: str = ""  # 具体爽点描述
+    爽点强度: int = 7  # 爽点强度 1-10
+    爽点位置: str = "中后段"  # 爽点出现位置：前段、中段、后段、中后段
+    
+    # 节奏设计
+    节奏类型: str = "快节奏"  # 节奏类型：快节奏、慢节奏、高潮节奏、过渡节奏
+    转折点数量: int = 3  # 预期转折点数量
+    节奏描述: str = ""  # 具体节奏设计描述
+    
+    # 钩子设计
+    钩子类型: str = "悬念钩"  # 钩子类型：悬念钩、反转钩、威胁钩、期待钩、冲突钩
+    钩子描述: str = ""  # 具体钩子描述
+    钩子强度: int = 7  # 钩子强度 1-10
+    
+    # 场景设计
+    场景数量: int = 3  # 预期场景数量
+    场景列表: list[str] = Field(default_factory=list)  # 具体场景描述列表
+    
+    # 情绪曲线
+    情绪起点: str = "平稳"  # 情绪起点：低沉、平稳、高昂、紧张
+    情绪终点: str = "期待"  # 情绪终点：低沉、平稳、高昂、期待、紧张
+    情绪转折点: int = 2  # 预期情绪转折点数量
+    
+    # 质量检查点
+    质量检查点: list[str] = Field(default_factory=list)  # 具体质量检查点列表
 
 
 class ChapterPlan(BaseModel):
@@ -186,6 +234,8 @@ class ChapterPlan(BaseModel):
     source: Literal["manual", "auto_replan"] = "manual"
     patch_id: str | None = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    # 增强字段
+    enhanced_spec: ChapterPlanEnhancedSpec | None = None  # 增强规划规范
 
 
 class WriteChapterRequest(BaseModel):

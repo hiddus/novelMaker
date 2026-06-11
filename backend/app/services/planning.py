@@ -1,4 +1,4 @@
-from app.schemas.domain import ChapterPlan, ChapterPlanCreate, Project, RetconPatch, StoryBible
+from app.schemas.domain import ChapterPlan, ChapterPlanCreate, ChapterPlanEnhancedSpec, Project, RetconPatch, StoryBible
 
 
 def generate_book_plan(project: Project) -> dict[str, object]:
@@ -21,6 +21,37 @@ def build_chapter_plan(payload: ChapterPlanCreate) -> ChapterPlan:
         "推动角色做出选择并承担代价",
         f"结尾留下钩子：{payload.hook}",
     ]
+    
+    # 生成增强规范
+    enhanced_spec = ChapterPlanEnhancedSpec(
+        爽点类型=payload.爽点类型 if payload.爽点类型 else "升级爽",
+        爽点描述=payload.爽点描述 or f"本章设计爽点：{payload.conflict}中的胜利或突破",
+        爽点强度=payload.爽点强度 if payload.爽点强度 else 7,
+        爽点位置=payload.爽点位置 if payload.爽点位置 else "中后段",
+        节奏类型=payload.节奏类型 if payload.节奏类型 else "快节奏",
+        转折点数量=payload.转折点数量 if payload.转折点数量 else 3,
+        节奏描述=payload.节奏描述 or f"采用{payload.节奏类型 or '快节奏'}，至少{payload.转折点数量 or 3}个转折点",
+        钩子类型=payload.钩子类型 if payload.钩子类型 else "悬念钩",
+        钩子描述=payload.钩子描述 or payload.hook,
+        钩子强度=payload.钩子强度 if payload.钩子强度 else 7,
+        场景数量=payload.场景数量 if payload.场景数量 else 3,
+        场景列表=payload.场景列表 or [
+            f"开场：{payload.goal}的起点",
+            f"发展：围绕{ payload.conflict}展开冲突",
+            f"高潮：爽点爆发 + 钩子设置"
+        ],
+        情绪起点=payload.情绪起点 if payload.情绪起点 else "平稳",
+        情绪终点=payload.情绪终点 if payload.情绪终点 else "期待",
+        情绪转折点=payload.情绪转折点 if payload.情绪转折点 else 2,
+        质量检查点=payload.质量检查点 or [
+            f"剧情推进：本章是否推进{payload.goal}",
+            f"爽点密度：是否包含{payload.爽点类型 or '升级爽'}",
+            f"节奏控制：是否有{payload.转折点数量 or 3}个以上转折",
+            f"钩子设置：结尾是否形成追读意愿",
+            f"人物一致：角色行为是否符合人设",
+        ],
+    )
+    
     return ChapterPlan(
         chapter_number=payload.chapter_number,
         goal=payload.goal,
@@ -28,6 +59,7 @@ def build_chapter_plan(payload: ChapterPlanCreate) -> ChapterPlan:
         hook=payload.hook,
         pov_character_id=payload.pov_character_id,
         beats=beats,
+        enhanced_spec=enhanced_spec,
     )
 
 
