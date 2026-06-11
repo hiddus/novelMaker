@@ -2,6 +2,7 @@ from app.core.config import get_settings
 from app.schemas.domain import ContextPack
 from app.services.memory import retrieve_long_term_memories
 from app.services.store import store
+from app.services.webnovel_knowledge import 爽点库, 追读要素
 
 
 def _approx_chars_from_tokens(token_budget: int) -> int:
@@ -34,39 +35,112 @@ def _overlap_score(text: str, keywords: list[str]) -> float:
     return float(sum(1 for keyword in keywords if keyword and keyword in text))
 
 
-def _score_event(chapter_number: int, summary: str, item_chapter: int, keywords: list[str]) -> float:
+def _爽点关键词匹配(text: str) -> float:
+    """检测文本中的爽点关键词匹配度"""
+    score = 0.0
+    for 爽点类型, 爽点信息 in 爽点库.items():
+        for 触发条件 in 爽点信息.get("触发条件", []):
+            if 触发条件 in text:
+                score += 1.5
+        for 典型表现 in 爽点信息.get("典型表现", []):
+            if 典型表现 in text:
+                score += 1.0
+    return score
+
+
+def _追读要素匹配(text: str) -> float:
+    """检测文本中的追读要素匹配度"""
+    score = 0.0
+    for 要素 in 追读要素.values():
+        for 关键词 in 要素.get("关键词", []):
+            if 关键词 in text:
+                score += 0.8
+    return score
+
+
+def _score_event(chapter_number: int, summary: str, item_chapter: int, keywords: list[str], chapter_plan=None) -> float:
+    # 基础时效性评分
+    recency = max(0.0, 10 - abs(chapter_number - item_chapter))
+    
+    # 关键词匹配评分
+    keyword_score = _overlap_score(summary, keywords) * 2.5
+    
+    # 爽点和追读要素增强评分
+    bonus_score = _爽点关键词匹配(summary) + _追读要素匹配(summary)
+    
+    # 章节规划相关性增强
+    plan_bonus = 0.0
+    if chapter_plan and chapter_plan.enhanced_spec:
+        plan_text = f"{chapter_plan.goal} {chapter_plan.conflict} {chapter_plan.hook} {chapter_plan.enhanced_spec.爽点描述}"
+        if any(keyword in plan_text for keyword in keywords if keyword):
+            plan_bonus = 2.0
+    
+    return recency + keyword_score + bonus_score + plan_bonus
+
+
+def _score_state(chapter_number: int, summary: str, item_chapter: int, keywords: list[str], character_role="") -> float:
     recency = max(0.0, 8 - abs(chapter_number - item_chapter))
-    return recency + _overlap_score(summary, keywords) * 2.0
-
-
-def _score_state(chapter_number: int, summary: str, item_chapter: int, keywords: list[str]) -> float:
-    recency = max(0.0, 7 - abs(chapter_number - item_chapter))
-    return recency + _overlap_score(summary, keywords) * 2.3
+    keyword_score = _overlap_score(summary, keywords) * 2.8
+    
+    # 角色重要性增强
+    role_bonus = 3.0 if character_role in {"protagonist", "lead"} else 1.0 if character_role == "support" else 0.3
+    
+    # 情绪和目标关键词增强
+    emotion_keywords = ["愤怒", "兴奋", "绝望", "决心", "震惊", "喜悦", "悲伤", "恐惧"]
+    emotion_bonus = sum(1.0 for kw in emotion_keywords if kw in summary) * 0.5
+    
+    return recency + keyword_score * role_bonus + emotion_bonus
 
 
 def _score_snapshot(chapter_number: int, summary: str, item_chapter: int, keywords: list[str]) -> float:
-    recency = max(0.0, 6 - abs(chapter_number - item_chapter))
-    return recency + _overlap_score(summary, keywords) * 1.8
+    recency = max(0.0, 7 - abs(chapter_number - item_chapter))
+    return recency + _overlap_score(summary, keywords) * 2.0
 
 
 def _score_patch(chapter_number: int, summary: str, target_chapter: int, keywords: list[str]) -> float:
-    proximity = 10.0 if target_chapter <= chapter_number else max(0.0, 6 - abs(chapter_number - target_chapter))
-    return proximity + _overlap_score(summary, keywords) * 2.5
+    proximity = 12.0 if target_chapter <= chapter_number else max(0.0, 8 - abs(chapter_number - target_chapter))
+    return proximity + _overlap_score(summary, keywords) * 3.0
 
 
-def _score_character(summary: str, keywords: list[str], role: str) -> float:
-    role_bonus = 2.0 if role in {"protagonist", "lead", "support"} else 0.5
-    return role_bonus + _overlap_score(summary, keywords) * 2.0
+def _score_character(summary: str, keywords: list[str], role: str, chapter_plan=None) -> float:
+    role_bonus = 4.0 if role == "protagonist" else 2.5 if role == "lead" else 1.5 if role == "support" else 0.5
+    keyword_score = _overlap_score(summary, keywords) * 2.5
+    
+    # 如果角色在章节规划中被提及，增加优先级
+    plan_bonus = 0.0
+    if chapter_plan:
+        plan_text = f"{chapter_plan.goal} {chapter_plan.conflict} {chapter_plan.hook}"
+        # 检查角色名是否在规划中
+        for keyword in keywords:
+            if keyword in plan_text and len(keyword) > 1:
+                plan_bonus = 3.0
+                break
+    
+    return role_bonus + keyword_score + plan_bonus
 
 
-def _score_relation(chapter_number: int, summary: str, item_chapter: int, keywords: list[str]) -> float:
-    recency = max(0.0, 6 - abs(chapter_number - item_chapter))
-    return recency + _overlap_score(summary, keywords) * 2.1
+def _score_relation(chapter_number: int, summary: str, item_chapter: int, keywords: list[str], is_current=False) -> float:
+    recency = max(0.0, 7 - abs(chapter_number - item_chapter))
+    keyword_score = _overlap_score(summary, keywords) * 2.3
+    
+    # 当前关系状态增强
+    current_bonus = 3.0 if is_current else 0.0
+    
+    # 关系类型增强
+    relation_bonus = 0.0
+    if "敌对" in summary or "仇恨" in summary:
+        relation_bonus = 2.0
+    elif "友谊" in summary or "爱情" in summary:
+        relation_bonus = 1.5
+    elif "师徒" in summary or "父子" in summary:
+        relation_bonus = 1.0
+    
+    return recency + keyword_score + current_bonus + relation_bonus
 
 
 def _score_timeline(chapter_number: int, summary: str, item_chapter: int, keywords: list[str]) -> float:
-    recency = max(0.0, 7 - abs(chapter_number - item_chapter))
-    return recency + _overlap_score(summary, keywords) * 1.9
+    recency = max(0.0, 8 - abs(chapter_number - item_chapter))
+    return recency + _overlap_score(summary, keywords) * 2.2
 
 
 def _dynamic_token_budget(
@@ -165,7 +239,7 @@ def build_context_pack(project_id: str, chapter_number: int) -> ContextPack:
     scored_events = sorted(
         (
             (
-                _score_event(chapter_number, item.summary, item.chapter_number, query_keywords),
+                _score_event(chapter_number, item.summary, item.chapter_number, query_keywords, chapter_plan),
                 item,
             )
             for item in events
@@ -176,6 +250,9 @@ def build_context_pack(project_id: str, chapter_number: int) -> ContextPack:
     )
     recent_events = [item for _, item in scored_events[: settings.context_max_events]]
 
+    # 创建角色ID到角色信息的映射
+    character_map = {char.id: char for char in characters}
+    
     scored_states = sorted(
         (
             (
@@ -189,6 +266,7 @@ def build_context_pack(project_id: str, chapter_number: int) -> ContextPack:
                     ),
                     item.chapter_number,
                     query_keywords,
+                    character_map.get(item.character_id, None).role if item.character_id in character_map else "",
                 ),
                 item,
             )
@@ -239,6 +317,7 @@ def build_context_pack(project_id: str, chapter_number: int) -> ContextPack:
                     " ".join([item.name, item.role, item.realm, " ".join(item.personality), item.core_motivation]),
                     query_keywords,
                     item.role,
+                    chapter_plan,
                 ),
                 item,
             )
@@ -256,8 +335,8 @@ def build_context_pack(project_id: str, chapter_number: int) -> ContextPack:
                     f"{item.source_character_id} {item.target_character_id} {item.relation_type} {item.evidence} {item.change_type}",
                     item.chapter_number,
                     query_keywords,
-                )
-                + (2.5 if item.is_current else 0.0),
+                    item.is_current,
+                ),
                 item,
             )
             for item in relationship_edges
@@ -289,14 +368,16 @@ def build_context_pack(project_id: str, chapter_number: int) -> ContextPack:
 
     hard_constraints = story_bible.world_rules + story_bible.forbidden_rules
     retrieval_priorities = [
-        "章节规划命中优先",
-        "高相关历史事件优先",
-        "高相关角色状态优先",
-        "开放伏笔优先",
-        "角色关系图谱优先",
-        "时间线节点与约束优先",
-        "开放补丁与回滚影响优先",
-        "章节号邻近度作为次级排序",
+        "【优先级1】章节规划匹配：增强规范中的爽点/节奏/钩子关键词",
+        "【优先级2】主角状态：protagonist/lead角色的情绪和目标",
+        "【优先级3】爽点触发事件：包含升级/打脸/逆袭/收获等关键词",
+        "【优先级4】追读要素：悬念/冲突/期待/回报相关内容",
+        "【优先级5】开放伏笔：未回收的钩子记录",
+        "【优先级6】角色关系：敌对/友谊/爱情等强关系类型",
+        "【优先级7】当前状态关系：is_current=True的关系边",
+        "【优先级8】时间线节点与约束：硬性时间顺序要求",
+        "【优先级9】开放补丁：需要重写或调整的内容",
+        "【优先级10】章节邻近度：越近的章节权重越高",
     ]
     token_budget = _dynamic_token_budget(
         settings.context_total_budget_tokens,
